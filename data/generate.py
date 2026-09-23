@@ -233,16 +233,18 @@ def generate() -> None:
                                "end": end.strftime("%Y-%m-%d")})
     stockouts = pd.DataFrame(stockout_rows)
 
-    # --- current stock levels: a few days-of-cover buffer per sku/warehouse
+    # --- current stock levels: realistic 35-90 days of cover per sku/warehouse
     recent = sales[sales["date"] >= (TODAY - pd.Timedelta(days=90)).strftime("%Y-%m-%d")]
     daily_avg = recent.groupby("sku")["qty"].sum() / 90.0
+    daily_avg_by_warehouse = recent.groupby(["sku", "warehouse"])["qty"].sum() / 90.0
     stock_rows = []
     for _, prod in products.iterrows():
         sku = prod["sku"]
         avg = float(daily_avg.get(sku, 1.0)) or 1.0
         for wh in WAREHOUSES:
-            days_cover = float(rng.uniform(10, 45))
-            on_hand = max(0, round(avg * 0.5 * days_cover))
+            warehouse_avg = float(daily_avg_by_warehouse.get((sku, wh), avg * 0.5)) or avg * 0.5
+            days_cover = float(rng.uniform(35, 90))
+            on_hand = max(0, round(warehouse_avg * days_cover))
             stock_rows.append({"sku": sku, "warehouse": wh, "on_hand": int(on_hand)})
     stock = pd.DataFrame(stock_rows)
     # DEMO-CRITICAL: ~5 days of cover, supplier lead time 30d -> definitely critical
