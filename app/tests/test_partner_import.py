@@ -7,7 +7,7 @@ import pytest
 from openpyxl import Workbook, load_workbook
 from streamlit.testing.v1 import AppTest
 
-from app import backend, orders
+from app import backend, orders, partner_import
 from app.partner_import import WAREHOUSE, convert_files, inspect_files, missing_reports
 
 APP = Path(__file__).resolve().parents[1]
@@ -193,6 +193,47 @@ def test_moq_import_still_rejects_unknown_text_constraint(iek_files):
 
     with pytest.raises(ValueError, match="нечисловое"):
         backend.load_partner_files(files, settings(), "2026-09-23")
+
+
+def test_na_marker_is_not_a_default_for_unknown_supplier_format():
+    files = (
+        ("Товар в пути SystemElectric 22.09.2026.xlsx", workbook([
+            ["Код 1с", "Артикул поставщика", "Наименование", "Январь 2026 г.",
+             "Август 2026 г.", "Остаток", "Зарезервировано", "Свободный остаток"],
+            ["0002_", "SYS-2", "Розетка тест", 10, 30, 100, 60, 40],
+        ])),
+        ("MOQ SystemElectric.xlsx", workbook([
+            ["№", "Номенклатура", "Номенклатура.Код", "Артикул", "Кратность"],
+            [1, "Розетка тест", "0002_", "SYS-2", "#N/A"],
+        ])),
+    )
+
+    with pytest.raises(ValueError, match="нечисловое"):
+        backend.load_partner_files(files, settings(), "2026-09-23")
+
+
+def test_inspection_rejects_file_above_safety_limit(monkeypatch, iek_files):
+    filename, content = iek_files[-1]
+    monkeypatch.setattr(partner_import, "MAX_FILE_BYTES", len(content) - 1, raising=False)
+
+    with pytest.raises(ValueError, match="слишком большой"):
+        inspect_files(((filename, content),))
+
+
+def test_inspection_rejects_excessive_expanded_size(monkeypatch, iek_files):
+    filename, content = iek_files[-1]
+    monkeypatch.setattr(partner_import, "MAX_EXPANDED_BYTES", 100, raising=False)
+
+    with pytest.raises(ValueError, match="после распаковки"):
+        inspect_files(((filename, content),))
+
+
+def test_import_rejects_worksheet_above_row_limit(monkeypatch, iek_files):
+    monkeypatch.setattr(partner_import, "MAX_DATA_ROWS", 0, raising=False)
+    reports = inspect_files(iek_files)
+
+    with pytest.raises(ValueError, match="слишком много строк"):
+        convert_files(iek_files, reports, settings(), "2026-09-23")
 
 
 def test_movements_sign_aggregation_and_no_double_count(iek_files):
