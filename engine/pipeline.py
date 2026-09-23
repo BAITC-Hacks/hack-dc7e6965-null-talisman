@@ -7,7 +7,7 @@ import math
 
 import pandas as pd
 
-from engine import demand, forecast, replenish
+from engine import demand, forecast, io, replenish
 
 MONTH_NAMES_RU = {
     1: "январь", 2: "февраль", 3: "март", 4: "апрель", 5: "май", 6: "июнь",
@@ -36,6 +36,14 @@ def _empty_result() -> pd.DataFrame:
 
 def _build_context(data: dict[str, pd.DataFrame], today: pd.Timestamp) -> dict:
     sales = data["sales"]
+    if not sales.empty:
+        # io.load_data() больше не знает дату расчёта на этапе загрузки, поэтому
+        # будущие относительно `today` продажи отбрасываем здесь.
+        sales = sales[sales["date"] <= today]
+    # BOM разворачиваем на каждый вызов, а не один раз при загрузке: так правки
+    # bom.csv/sales.csv (в т.ч. сценарии проверки на странице "Проверки") сразу
+    # отражаются в результате.
+    sales = io.explode_bom(sales, data.get("bom", pd.DataFrame()))
     trimmed_lines, oneoff_events = demand.detect_and_trim_oneoffs(sales)
     monthly = demand.monthly_clean_series(trimmed_lines, data["stockouts"], today)
     category_seasonal = forecast.build_category_seasonal(monthly, data["products"])
@@ -68,6 +76,15 @@ def recommend(data: dict[str, pd.DataFrame], params: dict | None = None) -> pd.D
     if p["today"] is None:
         raise ValueError("params['today'] обязателен")
     today = pd.Timestamp(p["today"])
+
+    # Защита от аномалий во входе: caller (в т.ч. сценарии проверки на странице
+    # "Проверки") может подмешать в_transit с сырыми типами (строковая дата и
+    # т.п.) без повторного прогона через io.clean() — приводим типы здесь же.
+    in_transit = data["in_transit"].copy()
+    if not in_transit.empty:
+        in_transit["eta"] = pd.to_datetime(in_transit["eta"], errors="coerce")
+        in_transit["qty"] = pd.to_numeric(in_transit["qty"], errors="coerce").fillna(0)
+        in_transit = in_transit.dropna(subset=["eta"])
 
     products = data["products"]
     if products.empty:
@@ -116,7 +133,7 @@ def recommend(data: dict[str, pd.DataFrame], params: dict | None = None) -> pd.D
         fcst_horizon, avg_daily = replenish.forecast_over_horizon(model, today, h_days, growth_pct)
         cutoff = today + pd.Timedelta(days=h_days)
         in_transit_qty, transit_overdue = replenish.in_transit_for(
-            data["in_transit"], sku, warehouse, today, cutoff
+            in_transit, sku, warehouse, today, cutoff
         )
         safety_stock = replenish.z_score(p["service_level"]) * model["sigma_month"] * math.sqrt(h_days / 30)
         need_raw = fcst_horizon + safety_stock - on_hand - in_transit_qty
@@ -164,8 +181,7 @@ def recommend(data: dict[str, pd.DataFrame], params: dict | None = None) -> pd.D
         next_month = (today + pd.DateOffset(months=1)).month
         season_factor = model["season_index"].get(next_month, 1.0)
 
-        transit_rows = data["in_transit"]
-        transit_rows = transit_rows[(transit_rows["sku"] == sku) & (transit_rows["warehouse"] == warehouse)] if not transit_rows.empty else transit_rows
+        transit_rows = in_transit[(in_transit["sku"] == sku) & (in_transit["warehouse"] == warehouse)] if not in_transit.empty else in_transit
         transit_eta = None
         if transit_rows is not None and not transit_rows.empty:
             transit_eta = transit_rows.sort_values("eta")["eta"].iloc[0].strftime("%d.%m.%Y")
@@ -206,9 +222,15 @@ def recommend(data: dict[str, pd.DataFrame], params: dict | None = None) -> pd.D
 
 
 def sku_series(data: dict[str, pd.DataFrame], sku: str, warehouse: str,
-               today: pd.Timestamp, growth_pct: float = 0.0, forward_months: int = 6) -> pd.DataFrame:
+               today: pd.Timestamp | None = None, growth_pct: float = 0.0,
+               forward_months: int = 6) -> pd.DataFrame:
     """История + прогноз для графика одной позиции.
-    Колонки: month, raw, clean, forecast, oneoff, stockout_flag."""
+    Колонки: month, raw, clean, forecast, oneoff (исключено шт. за месяц),
+    stockout_days (дней без товара за месяц). today=None -> берём последнюю
+    дату продаж в данных (карточка в UI вызывается без даты расчёта)."""
+    sales = data.get("sales")
+    if today is None:
+        today = sales["date"].max() if sales is not None and not sales.empty else pd.Timestamp.now()
     today = pd.Timestamp(today)
     ctx = _build_context(data, today)
     products = data["products"]
@@ -221,16 +243,24 @@ def sku_series(data: dict[str, pd.DataFrame], sku: str, warehouse: str,
     series = ctx["monthly"][(ctx["monthly"]["sku"] == sku) & (ctx["monthly"]["warehouse"] == warehouse)].sort_values("month")
     raw = ctx["raw_monthly"]
     raw = raw[(raw["sku"] == sku) & (raw["warehouse"] == warehouse)] if not raw.empty else raw
+    oneoff_events = ctx["oneoff_events"]
+    oneoff_events = oneoff_events[(oneoff_events["sku"] == sku) & (oneoff_events["warehouse"] == warehouse)] if not oneoff_events.empty else oneoff_events
 
     model = forecast.forecast_sku(series, category_index, growth_pct)
 
     out_rows = []
     for _, r in series.iterrows():
-        raw_val = raw[raw["month"] == r["month"]]["qty"].sum() if raw is not None and not raw.empty else r["actual"]
+        month = r["month"]
+        raw_val = raw[raw["month"] == month]["qty"].sum() if raw is not None and not raw.empty else r["actual"]
+        oneoff_qty = 0.0
+        if oneoff_events is not None and not oneoff_events.empty:
+            in_month = oneoff_events[oneoff_events["date"].dt.to_period("M") == month]
+            oneoff_qty = float(in_month["excluded_qty"].sum())
+        days_in_month = (month.end_time - month.start_time).days + 1
         out_rows.append({
-            "month": str(r["month"]), "raw": float(raw_val), "clean": float(r["clean"]),
-            "forecast": None, "oneoff": float(r["actual"]) != float(raw_val) if raw is not None else False,
-            "stockout_flag": r["availability_frac"] < demand.STOCKOUT_MIN_AVAILABILITY,
+            "month": str(month), "raw": float(raw_val), "clean": float(r["clean"]),
+            "forecast": None, "oneoff": oneoff_qty,
+            "stockout_days": (1 - float(r["availability_frac"])) * days_in_month,
         })
 
     last_month = series["month"].max() if not series.empty else today.to_period("M") - 1
@@ -239,7 +269,7 @@ def sku_series(data: dict[str, pd.DataFrame], sku: str, warehouse: str,
         val = forecast.forecast_month_value(model, h, m.month, growth_pct)
         out_rows.append({
             "month": str(m), "raw": None, "clean": None, "forecast": float(val),
-            "oneoff": False, "stockout_flag": False,
+            "oneoff": 0.0, "stockout_days": 0.0,
         })
 
     return pd.DataFrame(out_rows)

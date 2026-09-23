@@ -74,33 +74,41 @@ def validate(data: dict[str, pd.DataFrame]) -> list[str]:
     return warnings
 
 
-def clean(data: dict[str, pd.DataFrame], today: pd.Timestamp, salt: str | None = None) -> dict[str, pd.DataFrame]:
-    """Приводит типы, обезличивает клиентов, отбрасывает мусор. Возвращает новый dict."""
+def clean(data: dict[str, pd.DataFrame], today: pd.Timestamp | None = None, salt: str | None = None) -> dict[str, pd.DataFrame]:
+    """Приводит типы, обезличивает клиентов, отбрасывает мусор. Возвращает новый dict.
+    today=None -> дата расчёта ещё не известна на этапе загрузки (её выбирают в UI),
+    будущие продажи не отбрасываются здесь."""
     out = {k: v.copy() for k, v in data.items()}
 
     sales = out["sales"]
     if not sales.empty:
         sales["date"] = pd.to_datetime(sales["date"], errors="coerce")
-        sales["qty"] = pd.to_numeric(sales["qty"], errors="coerce")
-        sales["price"] = pd.to_numeric(sales.get("price"), errors="coerce")
+        sales["qty"] = pd.to_numeric(sales["qty"], errors="coerce").astype(float)
+        sales["price"] = pd.to_numeric(sales.get("price"), errors="coerce").astype(float)
         sales = sales.dropna(subset=["date", "sku", "qty"])
         sales = sales[sales["qty"] != 0]
-        sales = sales[sales["date"] <= today]
+        if today is not None:
+            sales = sales[sales["date"] <= today]
         sales["client_id"] = sales["client_id"].fillna("UNKNOWN").astype(str).map(
             lambda c: hash_client_id(c, salt)
         )
         sales = sales.drop_duplicates()
     out["sales"] = sales.reset_index(drop=True)
 
+    # Числовые колонки приводим именно к float64, не просто "числовому" типу:
+    # pd.to_numeric на целочисленном CSV-столбце возвращает int64, а любая
+    # последующая запись float-значения (масштабирование остатка, сценарии на
+    # странице "Проверки" и т.п.) в такую колонку падает в текущей версии
+    # pandas ("Invalid value ... for dtype int64").
     stock = out["stock"]
     if not stock.empty:
-        stock["on_hand"] = pd.to_numeric(stock["on_hand"], errors="coerce").fillna(0).clip(lower=0)
+        stock["on_hand"] = pd.to_numeric(stock["on_hand"], errors="coerce").fillna(0).clip(lower=0).astype(float)
     out["stock"] = stock
 
     in_transit = out["in_transit"]
     if not in_transit.empty:
         in_transit["eta"] = pd.to_datetime(in_transit["eta"], errors="coerce")
-        in_transit["qty"] = pd.to_numeric(in_transit["qty"], errors="coerce").fillna(0)
+        in_transit["qty"] = pd.to_numeric(in_transit["qty"], errors="coerce").fillna(0).astype(float)
         in_transit = in_transit.dropna(subset=["eta"])
     out["in_transit"] = in_transit
 
@@ -113,24 +121,24 @@ def clean(data: dict[str, pd.DataFrame], today: pd.Timestamp, salt: str | None =
 
     products = out["products"]
     if not products.empty:
-        products["pack_size"] = pd.to_numeric(products["pack_size"], errors="coerce").fillna(1).clip(lower=1)
-        products["moq"] = pd.to_numeric(products["moq"], errors="coerce").fillna(0).clip(lower=0)
+        products["pack_size"] = pd.to_numeric(products["pack_size"], errors="coerce").fillna(1).clip(lower=1).astype(float)
+        products["moq"] = pd.to_numeric(products["moq"], errors="coerce").fillna(0).clip(lower=0).astype(float)
     out["products"] = products
 
     suppliers = out["suppliers"]
     if not suppliers.empty:
-        suppliers["lead_time_days"] = pd.to_numeric(suppliers["lead_time_days"], errors="coerce").fillna(14)
-        suppliers["order_cycle_days"] = pd.to_numeric(suppliers["order_cycle_days"], errors="coerce").fillna(14)
+        suppliers["lead_time_days"] = pd.to_numeric(suppliers["lead_time_days"], errors="coerce").fillna(14).astype(float)
+        suppliers["order_cycle_days"] = pd.to_numeric(suppliers["order_cycle_days"], errors="coerce").fillna(14).astype(float)
     out["suppliers"] = suppliers
 
     growth = out["growth"]
     if not growth.empty:
-        growth["growth_pct"] = pd.to_numeric(growth["growth_pct"], errors="coerce").fillna(0.0)
+        growth["growth_pct"] = pd.to_numeric(growth["growth_pct"], errors="coerce").fillna(0.0).astype(float)
     out["growth"] = growth
 
     bom = out["bom"]
     if not bom.empty:
-        bom["qty_per"] = pd.to_numeric(bom["qty_per"], errors="coerce").fillna(1).clip(lower=0)
+        bom["qty_per"] = pd.to_numeric(bom["qty_per"], errors="coerce").fillna(1).clip(lower=0).astype(float)
     out["bom"] = bom
 
     return out
@@ -159,10 +167,22 @@ def explode_bom(sales: pd.DataFrame, bom: pd.DataFrame) -> pd.DataFrame:
 
 
 def load_and_prepare(source_dir: str | Path, today: pd.Timestamp, salt: str | None = None):
-    """Полный конвейер загрузки: читает, валидирует, чистит, разворачивает BOM.
-    Возвращает (data, warnings)."""
+    """Полный конвейер загрузки: читает, валидирует, чистит. Возвращает (data, warnings).
+    BOM НЕ разворачивается здесь — это делает recommend() при каждом вызове (см.
+    engine/pipeline.py::_build_context), чтобы правки bom.csv/sales.csv сразу были
+    видны в результате без повторной загрузки."""
     raw = load_dir(source_dir)
     warnings = validate(raw)
     cleaned = clean(raw, today, salt)
-    cleaned["sales"] = explode_bom(cleaned["sales"], cleaned["bom"])
+    return cleaned, warnings
+
+
+def load_data(source_dir: str | Path, salt: str | None = None):
+    """Контракт для UI (app/backend.py::load_files): дата расчёта на этом этапе
+    ещё не выбрана пользователем, поэтому будущие продажи не отбрасываются —
+    это забота recommend() через params['today']. BOM тоже разворачивает
+    recommend(), не здесь. Возвращает (data, warnings)."""
+    raw = load_dir(source_dir)
+    warnings = validate(raw)
+    cleaned = clean(raw, today=None, salt=salt)
     return cleaned, warnings

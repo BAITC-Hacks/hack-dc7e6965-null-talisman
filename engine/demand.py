@@ -41,10 +41,13 @@ def detect_and_trim_oneoffs(sales: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataF
     lines = lines.copy()
     lines["qty"] = lines["qty"].astype(float)  # медиана/обрезка разовых заказов даёт float
     lines["oneoff_excluded"] = 0.0
+    # .dt.to_period один раз на весь датасет, а не в цикле на каждую группу —
+    # раньше это (и построчный python-цикл ниже) держало ~150к строк продаж на
+    # каждый вызов recommend(), что превращало страницу "Проверки" в минуты ожидания.
+    lines["month"] = lines["date"].dt.to_period("M")
     events = []
 
-    for (sku, warehouse), idx in lines.groupby(["sku", "warehouse"]).groups.items():
-        grp = lines.loc[idx]
+    for (sku, warehouse), grp in lines.groupby(["sku", "warehouse"], sort=False):
         pos = grp[(grp["qty"] > 0) & (grp["client_id"] != "BOM")]
         if len(pos) < 3:
             continue
@@ -54,24 +57,26 @@ def detect_and_trim_oneoffs(sales: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataF
         if not scale or scale <= 0:
             scale = 1.0
 
-        month = grp["date"].dt.to_period("M")
-        median_month_total = grp.assign(month=month).groupby("month")["qty"].sum().median()
-        client_months = pos.assign(month=pos["date"].dt.to_period("M")).groupby("client_id")["month"].nunique()
+        median_month_total = grp.groupby("month")["qty"].sum().median()
+        client_months = pos.groupby("client_id")["month"].nunique()
 
-        for i in pos.index:
-            qty = lines.at[i, "qty"]
-            robust_z = (qty - median) / scale
-            significant = qty > ONEOFF_SIGNIFICANCE_FRAC * max(median_month_total, 0)
-            irregular = client_months.get(lines.at[i, "client_id"], 0) <= ONEOFF_MAX_CLIENT_MONTHS
-            if robust_z > ONEOFF_ROBUST_Z and significant and irregular:
-                excluded = qty - median
-                lines.at[i, "qty"] = median
-                lines.at[i, "oneoff_excluded"] = excluded
-                events.append({
-                    "sku": sku, "warehouse": warehouse, "date": grp.at[i, "date"],
-                    "client_id": grp.at[i, "client_id"], "excluded_qty": excluded,
-                })
+        robust_z = (pos["qty"] - median) / scale
+        significant = pos["qty"] > ONEOFF_SIGNIFICANCE_FRAC * max(median_month_total, 0)
+        irregular = pos["client_id"].map(client_months).fillna(0) <= ONEOFF_MAX_CLIENT_MONTHS
+        flagged = pos[(robust_z > ONEOFF_ROBUST_Z) & significant & irregular]
+        if flagged.empty:
+            continue
 
+        excluded = flagged["qty"] - median
+        lines.loc[flagged.index, "qty"] = median
+        lines.loc[flagged.index, "oneoff_excluded"] = excluded
+        for i in flagged.index:
+            events.append({
+                "sku": sku, "warehouse": warehouse, "date": flagged.at[i, "date"],
+                "client_id": flagged.at[i, "client_id"], "excluded_qty": excluded.at[i],
+            })
+
+    lines = lines.drop(columns=["month"])
     return lines, pd.DataFrame(events, columns=["sku", "warehouse", "date", "client_id", "excluded_qty"])
 
 

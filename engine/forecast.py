@@ -6,6 +6,8 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 
+from engine.demand import STOCKOUT_MIN_AVAILABILITY
+
 SEASON_MIN, SEASON_MAX = 0.3, 3.0
 SHORT_HISTORY_MONTHS = 24  # меньше -> используем сезонность категории
 TREND_WINDOW_MONTHS = 12
@@ -24,10 +26,10 @@ def _seasonal_ratio_to_cma(series: pd.Series) -> dict[int, float]:
         return {m: 1.0 for m in range(1, 13)}
     cma = series.rolling(12, center=True).mean()
     ratio = (series / cma).replace([np.inf, -np.inf], np.nan)
-    by_month = {}
-    for m in range(1, 13):
-        vals = ratio[[p.month == m for p in ratio.index]].dropna()
-        by_month[m] = float(vals.mean()) if len(vals) else 1.0
+    # groupby(month) вместо питоновского цикла по 12 месяцам с построчным
+    # сравнением Period.month — тот вариант доминировал в профиле recommend()
+    grouped = ratio.groupby(ratio.index.month).mean()
+    by_month = {m: (float(grouped[m]) if m in grouped.index and pd.notna(grouped[m]) else 1.0) for m in range(1, 13)}
     mean_factor = np.mean(list(by_month.values())) or 1.0
     return {m: float(np.clip(v / mean_factor, SEASON_MIN, SEASON_MAX)) for m, v in by_month.items()}
 
@@ -74,6 +76,21 @@ def _theil_sen_pct_per_month(deseason: pd.Series) -> float:
     return float(np.clip(pct_per_month, *TREND_CLIP))
 
 
+def _sigma_month(s: pd.Series, avail: pd.Series, window: int = 12) -> float:
+    """Стандартное отклонение спроса для страхового запаса. Месяцы с сорванной
+    доступностью товара (stockout) — это провал предложения, а не спроса, и не
+    компенсированные (availability_frac уже занижен, только когда stockout НЕ
+    отражён в данных) такие месяцы раздувают дисперсию мимо реальной волатильности
+    спроса. Поэтому считаем sigma по «нормальным» месяцам, если их хватает."""
+    recent = s.tail(window)
+    if len(recent) < 2:
+        return float(recent.mean() * 0.5) if len(recent) else 0.0
+    recent_avail = avail.reindex(recent.index).fillna(1.0)
+    normal = recent[recent_avail >= STOCKOUT_MIN_AVAILABILITY]
+    source = normal if len(normal) >= 6 else recent
+    return float(source.std(ddof=0)) if len(source) > 1 else float(recent.mean() * 0.5)
+
+
 def _wape(actual: np.ndarray, forecast: np.ndarray) -> float:
     denom = np.sum(np.abs(actual))
     if denom <= 0:
@@ -91,7 +108,9 @@ def forecast_sku(series: pd.DataFrame, category_index: dict[int, float], growth_
             "confidence": "low", "flags": ["new"], "wape_model": None, "wape_naive": None,
         }
 
-    s = series.sort_values("month").set_index("month")["clean"]
+    sorted_series = series.sort_values("month").set_index("month")
+    s = sorted_series["clean"]
+    avail = sorted_series.get("availability_frac", pd.Series(1.0, index=s.index))
     n_months = len(s)
     zero_frac = float((series["actual"] == 0).mean())
     flags = []
@@ -99,7 +118,7 @@ def forecast_sku(series: pd.DataFrame, category_index: dict[int, float], growth_
     if n_months < NEW_SKU_MIN_MONTHS:
         level = float(s.mean()) if n_months else 0.0
         return {
-            "level": level, "sigma_month": float(s.std(ddof=0)) if n_months > 1 else level * 0.5,
+            "level": level, "sigma_month": _sigma_month(s, avail) if n_months > 1 else level * 0.5,
             "trend_pct_month": 0.0, "season_index": category_index or {m: 1.0 for m in range(1, 13)},
             "confidence": "low", "flags": ["new"], "wape_model": None, "wape_naive": None,
         }
@@ -108,7 +127,7 @@ def forecast_sku(series: pd.DataFrame, category_index: dict[int, float], growth_
         nonzero = s[s > 0]
         level = float(nonzero.mean() * (1 - zero_frac)) if len(nonzero) else 0.0
         return {
-            "level": level, "sigma_month": float(s.std(ddof=0)),
+            "level": level, "sigma_month": _sigma_month(s, avail),
             "trend_pct_month": 0.0, "season_index": {m: 1.0 for m in range(1, 13)},
             "confidence": "medium" if n_months >= 12 else "low",
             "flags": ["intermittent"], "wape_model": None, "wape_naive": None,
@@ -128,7 +147,7 @@ def forecast_sku(series: pd.DataFrame, category_index: dict[int, float], growth_
     deseason = s / s.index.map(lambda p: season_index.get(p.month, 1.0))
     level = float(deseason.tail(LEVEL_WINDOW_MONTHS).mean())
     trend_pct_month = _theil_sen_pct_per_month(deseason)
-    sigma_month = float(s.tail(12).std(ddof=0)) if n_months >= 2 else level * 0.5
+    sigma_month = _sigma_month(s, avail) if n_months >= 2 else level * 0.5
 
     wape_model = wape_naive = None
     confidence = "medium"

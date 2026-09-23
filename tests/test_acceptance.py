@@ -61,17 +61,16 @@ def test_all_sources_affect_result(data, base_result):
     base_stockout = _row(base_result, "DEMO-STOCKOUT")
     assert changed["need_raw"] != base_stockout["need_raw"]
 
-    # BOM: продажа комплекта обязана давать дополнительный спрос на компонент.
-    # Проверяем на уровне explode_bom напрямую — эффект на 6-месячный уровень
-    # прогноза зависит от того, когда именно исторически продавался комплект,
-    # а сама разворачивающая логика должна работать всегда.
+    # BOM: recommend() разворачивает комплект в спрос на компоненты при каждом
+    # вызове (см. pipeline._build_context), поэтому продажи комплекта, убранные
+    # из sales, обязаны снизить потребность по компоненту.
     bom_rule = data["bom"].iloc[0]
-    component_direct = data["sales"].loc[
-        (data["sales"]["sku"] == bom_rule["component_sku"]) & (data["sales"]["client_id"] != "BOM"), "qty"
-    ].sum()
-    with_bom = engine_io.explode_bom(data["sales"], data["bom"])
-    component_with_bom = with_bom.loc[with_bom["sku"] == bom_rule["component_sku"], "qty"].sum()
-    assert component_with_bom > component_direct, "продажи комплекта должны добавлять спрос на компонент"
+    component_sku = bom_rule["component_sku"]
+    base_component = _row(base_result, component_sku)
+    d = copy.deepcopy(data)
+    d["sales"] = d["sales"][~d["sales"]["sku"].isin(data["bom"]["parent_sku"])].copy()
+    changed = _row(recommend(d, {"today": TODAY}), component_sku)
+    assert changed["need_raw"] != base_component["need_raw"]
 
 
 def _model_for(data, sku, warehouse="WH1", growth_pct=0.0):
@@ -96,18 +95,18 @@ def test_seasonality(data):
 
 
 def test_lost_demand_compensated(data, base_result):
-    """Must-have 3: для артикула со stockout прогноз спроса скорректирован
-    вверх по сравнению с расчётом без учёта дней отсутствия товара."""
+    """Must-have 3: для артикула со stockout расчётная потребность скорректирована
+    в большую сторону по сравнению с расчётом без учёта дней отсутствия товара
+    (и по прогнозу спроса, и по итоговой потребности — sigma страхового запаса
+    тоже не должна раздуваться из-за нескомпенсированного провала продаж)."""
     with_stockout = _row(base_result, "DEMO-STOCKOUT")
     assert with_stockout["lost_demand_added"] > 0
 
     d = copy.deepcopy(data)
     d["stockouts"] = d["stockouts"][d["stockouts"]["sku"] != "DEMO-STOCKOUT"]
     without_stockout = _row(recommend(d, {"today": TODAY}), "DEMO-STOCKOUT")
-    # forecast_horizon — прямая мера скорректированного спроса; need_raw дополнительно
-    # зависит от страхового запаса, который снижается вместе со сглаженной вариацией
-    # ряда при компенсации, поэтому здесь сравниваем именно прогноз спроса.
     assert with_stockout["forecast_horizon"] > without_stockout["forecast_horizon"]
+    assert with_stockout["need_raw"] > without_stockout["need_raw"]
 
 
 def test_oneoff_excluded(base_result):
@@ -154,8 +153,7 @@ def test_robust_to_garbage_input():
         {"date": (TODAY - pd.Timedelta(days=1)).strftime("%Y-%m-%d"), "sku": "SKU-0000", "qty": 0, "client_id": "X", "price": 1, "warehouse": "WH1"},
     ])], ignore_index=True)
     raw["stock"].loc[raw["stock"]["sku"] == "SKU-0000", "on_hand"] = -5
-    cleaned = engine_io.clean(raw, TODAY)
-    cleaned["sales"] = engine_io.explode_bom(cleaned["sales"], cleaned["bom"])
+    cleaned = engine_io.clean(raw, TODAY)  # recommend() explodes BOM itself, no need to do it here
     result = recommend(cleaned, {"today": TODAY})
     assert not result.empty
 
