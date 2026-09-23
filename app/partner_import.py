@@ -305,7 +305,16 @@ def convert_files(files, reports, settings, today):
         if "moq" in frames:
             mf = frames["moq"].set_index("sku")
             column = "кратность" if "кратность" in mf else "мин. разр. к отгр."
-            values = _numbers(mf[column], column, True)
+            missing_marker = mf[column].map(text).str.upper().eq("#N/A")
+            values = _numbers(mf[column].mask(missing_marker, ""), column, True)
+            missing_count = int(missing_marker.sum())
+            if missing_count:
+                default = "кратность 1" if column == "кратность" else "MOQ 0"
+                noun = "значение" if missing_count == 1 else "значений"
+                warnings.append(
+                    f"{BRANDS[brand]}: {missing_count} {noun} #N/A принято как отсутствие ограничения; "
+                    f"используется {default}."
+                )
             if (values % 1 != 0).any():
                 raise ValueError("Дробная кратность/MOQ не поддерживается целочисленным заказом. Уточните единицы измерения.")
             field = "pack_size" if column == "кратность" else "moq"
