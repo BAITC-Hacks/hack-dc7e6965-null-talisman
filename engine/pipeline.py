@@ -38,8 +38,9 @@ def _build_context(data: dict[str, pd.DataFrame], today: pd.Timestamp) -> dict:
     sales = data["sales"]
     if not sales.empty:
         # io.load_data() больше не знает дату расчёта на этапе загрузки, поэтому
-        # будущие относительно `today` продажи отбрасываем здесь.
-        sales = sales[sales["date"] <= today]
+        # будущие относительно `today` продажи отбрасываем здесь же (и для тех
+        # вызывающих, кто передал уже загруженный датасет напрямую).
+        sales = sales.loc[sales["date"] <= today].copy()
     # BOM разворачиваем на каждый вызов, а не один раз при загрузке: так правки
     # bom.csv/sales.csv (в т.ч. сценарии проверки на странице "Проверки") сразу
     # отражаются в результате.
@@ -267,9 +268,10 @@ def sku_series(data: dict[str, pd.DataFrame], sku: str, warehouse: str,
             "stockout_days": int(round((1.0 - float(r["availability_frac"])) * month.days_in_month)),
         })
 
-    last_month = series["month"].max() if not series.empty else today.to_period("M") - 1
-    for h in range(1, forward_months + 1):
-        m = last_month + h
+    # Match replenish.forecast_over_horizon: the calculation month has h=0.
+    # Anchor to the selected date, even when the last sale was months ago.
+    for h in range(forward_months):
+        m = today.to_period("M") + h
         val = forecast.forecast_month_value(model, h, m.month, growth_pct)
         out_rows.append({
             "month": str(m), "raw": None, "clean": None, "forecast": float(val),

@@ -53,7 +53,7 @@ def sources(data, params, recommend):
 
     changed = copy_data(data)
     transit = changed.get("in_transit", pd.DataFrame(columns=["sku", "warehouse", "qty", "eta"]))
-    changed["in_transit"] = pd.concat([transit, pd.DataFrame([dict(sku=row.sku, warehouse=row.warehouse, qty=500, eta=params["today"])])], ignore_index=True)
+    changed["in_transit"] = pd.concat([transit, pd.DataFrame([dict(sku=row.sku, warehouse=row.warehouse, qty=500, eta=pd.Timestamp(params["today"]))])], ignore_index=True)
     compare("В пути +500 шт. → потребность", changed)
 
     nonzero = base[base.on_hand > 0]
@@ -61,6 +61,7 @@ def sources(data, params, recommend):
         raise MissingEvidence("Для проверки остатков нужен товар с положительным остатком.")
     stockrow = nonzero.iloc[0]
     changed = copy_data(data)
+    changed["stock"]["on_hand"] = changed["stock"]["on_hand"].astype(float)
     mask = changed["stock"].sku.eq(stockrow.sku) & changed["stock"].warehouse.eq(stockrow.warehouse)
     changed["stock"].loc[mask, "on_hand"] = changed["stock"].loc[mask, "on_hand"].astype(float) * .5
     compare("Остаток −50% → потребность", changed, target=(stockrow.sku, stockrow.warehouse))
@@ -73,8 +74,15 @@ def sources(data, params, recommend):
     if not alternatives:
         raise MissingEvidence("Для проверки категории нужны минимум две категории.")
     changed = copy_data(data)
+    # Category seasonality is used for short histories. A mature SKU may
+    # correctly use its own seasonal profile regardless of category.
+    cutoff = pd.Timestamp(params["today"]) - pd.DateOffset(months=12)
+    changed["sales"] = changed["sales"].loc[~changed["sales"].sku.eq(row.sku) | (changed["sales"].date >= cutoff)].copy()
+    category_before = select(recommend(copy_data(changed), dict(params)), *identity).need_raw
     changed["products"].loc[changed["products"].sku.eq(row.sku), "category"] = alternatives[0]
-    compare("Другая категория → потребность", changed)
+    category_after = select(recommend(changed, dict(params)), *identity).need_raw
+    rows.append(comparison("Короткая история: другая категория → потребность", category_before,
+                           category_after, not np.isclose(category_before, category_after)))
 
     target = select(base, "DEMO-STOCKOUT")
     changed = copy_data(data)
@@ -90,14 +98,18 @@ def sources(data, params, recommend):
         raise MissingEvidence("Нет продаж комплектов с компонентами в результате расчёта.")
     target = select(base, entries.iloc[0].component_sku)
     changed = copy_data(data)
-    changed["sales"] = changed["sales"][~changed["sales"].sku.isin(bom.parent_sku)].copy()
+    # load_data already exploded the kits. Remove both the parent sales and
+    # their derived component rows, marked by the loader with client_id=BOM.
+    changed["sales"] = changed["sales"][~changed["sales"].sku.isin(bom.parent_sku) & changed["sales"].client_id.ne("BOM")].copy()
     compare("Без продаж комплектов → потребность компонента", changed, target=(target.sku, target.warehouse))
     return rows
 
 
 def seasonal(data, params, recommend):
     base = select(recommend(copy_data(data), dict(params)), "DEMO-SEASON")
-    series = engine_function("engine.pipeline", "sku_series")(copy_data(data), base.sku, base.warehouse)
+    series_fn = engine_function("engine.pipeline", "sku_series")
+    series = series_fn(copy_data(data), base.sku, base.warehouse,
+                       today=params["today"], growth_pct=float(base.growth_pct), forward_months=12)
     predictions = series.loc[series.forecast.notna(), ["month", "forecast"]].copy()
     predictions["month"] = pd.to_datetime(predictions.month.astype(str))
     if predictions.month.dt.month.nunique() < 12:
@@ -122,10 +134,10 @@ def seasonal(data, params, recommend):
             outages = outages[pd.to_datetime(outages.start) < start].copy()
             outages["end"] = pd.to_datetime(outages.end).clip(upper=start - pd.Timedelta(days=1))
             changed["stockouts"] = outages
-        changed["suppliers"]["lead_time_days"] = 0
-        settings = dict(params, today=start.date().isoformat(), review_days=month.days_in_month,
-                        growth_override={category: 0 for category in data["products"].category.unique()})
-        predicted = float(select(recommend(changed, settings), base.sku, base.warehouse).forecast_horizon)
+        prediction = series_fn(changed, base.sku, base.warehouse, today=start,
+                               growth_pct=0, forward_months=1)
+        prediction_month = pd.to_datetime(prediction.month.astype(str)).dt.to_period("M")
+        predicted = float(prediction.loc[prediction_month.eq(month), "forecast"].dropna().iloc[0])
         relevant = actual_sales[actual_sales.sku.eq(base.sku) & actual_sales.warehouse.eq(base.warehouse)]
         observed = float(relevant.loc[(relevant.date >= start) & (relevant.date < end), "qty"].sum())
         history = relevant[relevant.date < start].groupby(relevant.date.dt.to_period("M")).qty.sum()
@@ -148,10 +160,12 @@ def seasonal(data, params, recommend):
 def stockouts(data, params, recommend):
     with_outages = select(recommend(copy_data(data), dict(params)), "DEMO-STOCKOUT")
     changed = copy_data(data)
-    changed["stockouts"] = changed["stockouts"].iloc[:0].copy()
+    changed["stockouts"] = changed["stockouts"].loc[changed["stockouts"].sku.ne(with_outages.sku)].copy()
     without = select(recommend(changed, dict(params)), with_outages.sku, with_outages.warehouse)
-    return [comparison("Потребность без восстановления → с восстановлением", without.need_raw, with_outages.need_raw,
-                       with_outages.need_raw > without.need_raw)]
+    # Match tests/test_acceptance.py: restored demand increases the forecast.
+    # need_raw also includes safety stock, which can fall as variance decreases.
+    return [comparison("Прогноз спроса без восстановления → с восстановлением", without.forecast_horizon,
+                       with_outages.forecast_horizon, with_outages.forecast_horizon > without.forecast_horizon)]
 
 
 def oneoff(data, params, recommend):
@@ -159,18 +173,21 @@ def oneoff(data, params, recommend):
     changed = copy_data(data)
     sales = changed["sales"]
     matching = sales[sales.sku.eq(base.sku) & sales.warehouse.eq(base.warehouse) & (sales.qty > 0)]
+    matching = matching[matching.date < pd.Timestamp(params["today"]).to_period("M").start_time]
     if matching.empty:
         raise MissingEvidence("Нет обычных продаж DEMO-ONEOFF для сравнения.")
-    extra = matching.iloc[-1].copy()
+    extra = matching.sort_values("date").iloc[-1].copy()
     # Add a genuinely new customer to an existing historical date.
     extra["client_id"] = "ui-check-oneoff-new-customer"
     while extra["client_id"] in set(sales.client_id):
         extra["client_id"] += "-new"
     extra["qty"] = float(matching.qty.median()) * 50
-    changed["sales"] = pd.concat([sales, extra.to_frame().T], ignore_index=True)
+    changed["sales"] = pd.concat([sales, pd.DataFrame([extra.to_dict()])], ignore_index=True)
     after = select(recommend(changed, dict(params)), base.sku, base.warehouse)
     return [comparison("К заказу после разовой продажи 50× медианы (рост ≤10%)", base.recommended_qty,
-                       after.recommended_qty, after.recommended_qty <= base.recommended_qty * 1.1)]
+                       after.recommended_qty, after.recommended_qty <= base.recommended_qty * 1.1),
+            comparison("Исключённый сверхобъём: до → после добавления", base.oneoff_excluded,
+                       after.oneoff_excluded, after.oneoff_excluded > base.oneoff_excluded)]
 
 
 def grouping(data, params, recommend):

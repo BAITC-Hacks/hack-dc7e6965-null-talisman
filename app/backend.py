@@ -43,7 +43,7 @@ def demo_files() -> tuple:
 
 
 @st.cache_data(show_spinner=False, max_entries=4)
-def load_files(files: tuple):
+def load_files(files: tuple, today=None):
     """CSV/XLSX uploads are normalized to CSV for the engine's directory loader."""
     names = set()
     if not files:
@@ -67,7 +67,7 @@ def load_files(files: tuple):
                 table.to_csv(target, index=False)
             else:
                 target.write_bytes(content)
-        loaded = loader(Path(directory))
+        loaded = loader(Path(directory), today=today) if today is not None else loader(Path(directory))
     # The planned loader may expose warnings alongside the dictionary.
     data, warnings = loaded if isinstance(loaded, tuple) and len(loaded) == 2 else (loaded, [])
     if not isinstance(data, dict):
@@ -112,8 +112,10 @@ def calculate(data, params):
 
 
 @st.cache_data(show_spinner=False, max_entries=32)
-def series(data, sku, warehouse):
-    result = engine_function("engine.pipeline", "sku_series")(data, sku, warehouse)
+def series(data, sku, warehouse, today=None, growth_pct=0.0, forward_months=6):
+    result = engine_function("engine.pipeline", "sku_series")(
+        data, sku, warehouse, today=today, growth_pct=growth_pct, forward_months=forward_months
+    )
     if not isinstance(result, pd.DataFrame) or not {"month", "raw", "clean", "forecast"}.issubset(result):
         raise ValueError("Для графика нужны month, raw, clean, forecast из sku_series.")
     return result

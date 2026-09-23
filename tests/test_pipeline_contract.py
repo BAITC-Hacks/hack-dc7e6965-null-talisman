@@ -104,8 +104,12 @@ def test_ui_engine_entrypoints_are_compatible(demo_dir: Path) -> None:
     assert stockout["stockout_days"].max() > 0
 
 
-def test_real_engine_connects_to_streamlit(demo_dir, monkeypatch):
-    from app import backend
+def test_real_engine_connects_to_streamlit(demo_dir, monkeypatch, tmp_path):
+    import hashlib
+    import io
+    import json
+    from app import backend, orders
+    from openpyxl import load_workbook
     from streamlit.testing.v1 import AppTest
 
     files = []
@@ -117,6 +121,8 @@ def test_real_engine_connects_to_streamlit(demo_dir, monkeypatch):
             table = table.iloc[:0]
         files.append((path.name, table.to_csv(index=False).encode("utf-8")))
     monkeypatch.setattr(backend, "demo_files", lambda: tuple(files))
+    original_approve = orders.approve
+    monkeypatch.setattr(orders, "approve", lambda frame, author, params: original_approve(frame, author, params, tmp_path))
     backend.load_files.clear()
     backend.calculate.clear()
     backend.series.clear()
@@ -128,8 +134,25 @@ def test_real_engine_connects_to_streamlit(demo_dir, monkeypatch):
     button.click().run()
     assert not app.exception
     assert not app.session_state["result"].empty
+    next(item for item in app.checkbox if item.label == "Показать обоснование и график").check().run()
+    assert not app.exception
     assert len(app.get("plotly_chart")) > 0
     assert not any("Не удалось" in item.value for item in app.warning)
+    supplier = str(app.session_state["result"].iloc[0].supplier_id)
+    quantity = int(app.session_state["result"].iloc[0].recommended_qty) + 5
+    app.text_input(key="approver").set_value("Интеграционный тест").run()
+    editor_key = "editor_" + hashlib.sha256(supplier.encode()).hexdigest()[:12] + "_1"
+    app.session_state[editor_key] = {"edited_rows": {0: {"recommended_qty": quantity}}, "added_rows": [], "deleted_rows": []}
+    next(item for item in app.button if item.label.startswith("Утвердить заказ")).click().run()
+    assert not app.exception
+    assert len(app.get("download_button")) == 4
+    payload = json.loads(next(tmp_path.glob("*.json")).read_text(encoding="utf-8"))
+    assert payload["items"][0]["recommended_qty"] == quantity
+    exported = pd.DataFrame(payload["items"])
+    workbook = load_workbook(io.BytesIO(orders.xlsx_bytes(exported)))
+    assert workbook.active["D2"].value == quantity
+    assert workbook.active.max_column == 8
+    assert pd.read_csv(io.BytesIO(orders.csv_bytes(exported)), sep=";").iloc[0]["Количество"] == quantity
 
 
 def test_loader_reports_missing_required_column(tmp_path):
@@ -142,3 +165,43 @@ def test_loader_reports_missing_required_column(tmp_path):
         table.to_csv(tmp_path / f"{name}.csv", index=False)
     with pytest.raises(ValueError, match="sales.*date"):
         load_data(tmp_path)
+
+
+def test_chart_matches_selected_date_growth_and_order(prepared_data):
+    import copy
+    from app.backend import series
+    from engine.pipeline import recommend
+
+    data = copy.deepcopy(prepared_data)
+    data["suppliers"]["lead_time_days"] = 1
+    category = data["products"].loc[data["products"].sku.eq("DEMO-SEASON"), "category"].iloc[0]
+    params = dict(today="2026-09-01", review_days=28, growth_override={category: 20})
+    recommendation = recommend(data, params)
+    row = recommendation.loc[recommendation.sku.eq("DEMO-SEASON") & recommendation.warehouse.eq("WH1")].iloc[0]
+    plotted = series(data, row.sku, row.warehouse, params["today"], row.growth_pct, 12)
+    predicted = plotted.loc[plotted.forecast.notna()]
+    assert predicted.iloc[0].month == "2026-09"
+    assert predicted.iloc[-1].month == "2027-08"
+    # Sep 2–30 is 29/30 of the same monthly prediction displayed in the chart.
+    assert row.forecast_horizon == pytest.approx(predicted.iloc[0].forecast * 29 / 30)
+    baseline = series(data, row.sku, row.warehouse, params["today"], 0, 12)
+    assert predicted.iloc[0].forecast == pytest.approx(baseline.forecast.dropna().iloc[0] * 1.2)
+
+
+def test_ui_loader_uses_selected_cutoff(demo_dir):
+    from app.backend import load_files
+    files = tuple((path.name, path.read_bytes()) for path in sorted(demo_dir.glob("*.csv")))
+    data, _ = load_files(files, "2025-10-01")
+    assert data["sales"].date.max() <= pd.Timestamp("2025-10-01")
+    customer_ids = data["sales"].loc[data["sales"].client_id.ne("BOM"), "client_id"]
+    assert customer_ids.str.fullmatch(r"[0-9a-f]{10}").all()
+
+
+def test_live_ui_checks_with_real_engine(prepared_data):
+    from app.checks import run_checks
+    before = prepared_data["sales"].copy(deep=True)
+    report = run_checks(prepared_data, {"today": "2026-09-23"})
+    assert len(report) == 5
+    assert all(check.status == "passed" for check in report), report
+    assert all(check.rows for check in report)
+    pd.testing.assert_frame_equal(prepared_data["sales"], before)
