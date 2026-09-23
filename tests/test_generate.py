@@ -28,18 +28,29 @@ EXPECTED_COLUMNS = {
 }
 
 
+def _generate_to(directory: Path, seed: int = 42) -> dict[str, Path]:
+    from data import generate as generator
+
+    original_output, original_seed = generator.OUT_DIR, generator.SEED
+    try:
+        generator.OUT_DIR = directory
+        generator.SEED = seed
+        generator.generate()
+    finally:
+        generator.OUT_DIR = original_output
+        generator.SEED = original_seed
+    return {path.name: path for path in directory.glob("*.csv")}
+
+
 def _csv_bytes(directory: Path) -> dict[str, bytes]:
     return {path.name: path.read_bytes() for path in sorted(directory.glob("*.csv"))}
 
 
 def test_generate_demo_data_is_deterministic(tmp_path: Path) -> None:
-    from data.generate import generate_demo_data
+    first_dir, second_dir = tmp_path / "first", tmp_path / "second"
 
-    first_dir = tmp_path / "first"
-    second_dir = tmp_path / "second"
-
-    first = generate_demo_data(first_dir, seed=42)
-    second = generate_demo_data(second_dir, seed=42)
+    first = _generate_to(first_dir)
+    second = _generate_to(second_dir)
 
     assert set(first) == EXPECTED_FILES
     assert set(second) == EXPECTED_FILES
@@ -47,59 +58,71 @@ def test_generate_demo_data_is_deterministic(tmp_path: Path) -> None:
 
 
 def test_generate_demo_data_writes_all_contract_schemas(tmp_path: Path) -> None:
-    from data.generate import generate_demo_data
-
     output_dir = tmp_path / "demo"
-    generate_demo_data(output_dir, seed=42)
+    _generate_to(output_dir)
 
     for filename, expected_columns in EXPECTED_COLUMNS.items():
         assert set(pd.read_csv(output_dir / filename).columns) == expected_columns
 
 
 def test_generate_demo_data_contains_contract_and_demo_skus(tmp_path: Path) -> None:
-    from data.generate import DEMO_SKUS, generate_demo_data
+    from data.generate import DEMO_SKUS
 
     output_dir = tmp_path / "demo"
-    generate_demo_data(output_dir, seed=42)
+    _generate_to(output_dir)
 
     products = pd.read_csv(output_dir / "products.csv")
     sales = pd.read_csv(output_dir / "sales.csv")
     stock = pd.read_csv(output_dir / "stock.csv")
 
     assert set(DEMO_SKUS).issubset(set(products["sku"]))
-    assert {"date", "sku", "qty", "client_id", "price", "warehouse"} == set(
-        sales.columns
-    )
-    assert {"sku", "warehouse", "on_hand"} == set(stock.columns)
     assert len(products) >= 150
     assert sales["warehouse"].nunique() == 2
     assert sales["date"].nunique() >= 1_000
+    assert set(stock["warehouse"]) == {"WH1", "WH2"}
 
 
 def test_reference_skus_encode_demo_scenarios(tmp_path: Path) -> None:
-    from data.generate import generate_demo_data
+    from data.generate import TODAY
 
     output_dir = tmp_path / "demo"
-    generate_demo_data(output_dir, seed=42)
+    _generate_to(output_dir)
 
     products = pd.read_csv(output_dir / "products.csv")
     suppliers = pd.read_csv(output_dir / "suppliers.csv")
     stock = pd.read_csv(output_dir / "stock.csv")
-    transit = pd.read_csv(output_dir / "in_transit.csv")
+    transit = pd.read_csv(output_dir / "in_transit.csv", parse_dates=["eta"])
     sales = pd.read_csv(output_dir / "sales.csv", parse_dates=["date"])
     stockouts = pd.read_csv(output_dir / "stockouts.csv")
 
-    transit_demo = transit.loc[transit["sku"] == "DEMO-TRANSIT"]
-    assert len(transit_demo) == 1
-    assert float(transit_demo.iloc[0]["qty"]) == 2_000
-    assert pd.Timestamp(transit_demo.iloc[0]["eta"]) > pd.Timestamp("2026-09-23")
+    transit_demo = transit.loc[
+        (transit["sku"] == "DEMO-TRANSIT") & (transit["eta"] > TODAY)
+    ]
+    recent = sales.loc[
+        (sales["sku"] == "DEMO-TRANSIT")
+        & (sales["date"] >= TODAY - pd.Timedelta(days=90)),
+        "qty",
+    ]
+    assert not transit_demo.empty
+    assert float(transit_demo["qty"].max()) >= float(recent.sum()) / 90 * 45
 
-    critical = (
-        products.loc[products["sku"] == "DEMO-CRITICAL"]
-        .merge(suppliers, on="supplier_id", validate="many_to_one")
+    critical = products.loc[products["sku"] == "DEMO-CRITICAL"].merge(
+        suppliers, on="supplier_id", validate="many_to_one"
     )
+    critical_daily = (
+        sales.loc[
+            (sales["sku"] == "DEMO-CRITICAL")
+            & (sales["date"] >= TODAY - pd.Timedelta(days=90)),
+            "qty",
+        ].sum()
+        / 90
+    )
+    critical_stock = stock.loc[
+        (stock["sku"] == "DEMO-CRITICAL") & (stock["warehouse"] == "WH1"),
+        "on_hand",
+    ].iloc[0]
     assert int(critical.iloc[0]["lead_time_days"]) >= 30
-    assert stock.loc[stock["sku"] == "DEMO-CRITICAL", "on_hand"].max() <= 5
+    assert critical_stock / critical_daily <= 6
 
     outage = stockouts.loc[stockouts["sku"] == "DEMO-STOCKOUT"].iloc[0]
     outage_sales = sales.loc[
@@ -111,26 +134,22 @@ def test_reference_skus_encode_demo_scenarios(tmp_path: Path) -> None:
     assert not outage_sales.loc[outage_sales["warehouse"] != outage["warehouse"]].empty
 
 
-def test_growth_defaults_to_zero_and_new_skus_have_short_history(tmp_path: Path) -> None:
-    from data.generate import NEW_SKUS, generate_demo_data
-
+def test_growth_defaults_to_zero_and_demo_growth_is_organic(tmp_path: Path) -> None:
     output_dir = tmp_path / "demo"
-    generate_demo_data(output_dir, seed=42)
+    _generate_to(output_dir)
 
     growth = pd.read_csv(output_dir / "growth.csv")
     sales = pd.read_csv(output_dir / "sales.csv", parse_dates=["date"])
-    new_sales = sales.loc[sales["sku"].isin(NEW_SKUS)]
+    demo = sales.loc[sales["sku"] == "DEMO-GROWTH"].copy()
+    monthly = demo.groupby(demo["date"].dt.to_period("M"))["qty"].sum()
 
     assert growth["growth_pct"].eq(0).all()
-    assert set(NEW_SKUS).issubset(set(new_sales["sku"]))
-    assert new_sales["date"].min() >= pd.Timestamp("2026-08-01")
+    assert monthly.tail(6).mean() > monthly.head(6).mean()
 
 
 def test_bom_models_three_multi_component_kits(tmp_path: Path) -> None:
-    from data.generate import generate_demo_data
-
     output_dir = tmp_path / "demo"
-    generate_demo_data(output_dir, seed=42)
+    _generate_to(output_dir)
 
     bom = pd.read_csv(output_dir / "bom.csv")
     component_counts = bom.groupby("parent_sku")["component_sku"].nunique()

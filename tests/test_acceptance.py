@@ -6,7 +6,8 @@ import copy
 import pandas as pd
 import pytest
 
-from data.generate import TODAY, generate, OUT_DIR
+from data import generate as generator
+from data.generate import TODAY
 from engine import demand, forecast
 from engine import io as engine_io
 from engine.io import load_and_prepare
@@ -14,10 +15,20 @@ from engine.pipeline import recommend
 
 
 @pytest.fixture(scope="module")
-def data():
-    if not (OUT_DIR / "sales.csv").exists():
-        generate()
-    cleaned, warnings = load_and_prepare(OUT_DIR, TODAY)
+def demo_dir(tmp_path_factory):
+    output = tmp_path_factory.mktemp("acceptance-demo")
+    previous = generator.OUT_DIR
+    try:
+        generator.OUT_DIR = output
+        generator.generate()
+    finally:
+        generator.OUT_DIR = previous
+    return output
+
+
+@pytest.fixture(scope="module")
+def data(demo_dir):
+    cleaned, warnings = load_and_prepare(demo_dir, TODAY)
     return cleaned
 
 
@@ -144,11 +155,11 @@ def test_grouped_by_supplier_with_explanations(base_result):
     assert base_result["supplier_id"].notna().all()
 
 
-def test_robust_to_garbage_input():
+def test_robust_to_garbage_input(demo_dir):
     """Устойчивость: мусорные/отрицательные значения не должны валить расчёт.
     Мусор добавляем на "сыром" уровне и прогоняем через io.clean(), как это
     происходит при обычной загрузке файлов."""
-    raw = engine_io.load_dir(OUT_DIR)
+    raw = engine_io.load_dir(demo_dir)
     raw["sales"] = pd.concat([raw["sales"], pd.DataFrame([
         {"date": "not-a-date", "sku": "SKU-0000", "qty": "abc", "client_id": "X", "price": 1, "warehouse": "WH1"},
         {"date": (TODAY - pd.Timedelta(days=1)).strftime("%Y-%m-%d"), "sku": "SKU-0000", "qty": 0, "client_id": "X", "price": 1, "warehouse": "WH1"},

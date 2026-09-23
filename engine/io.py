@@ -158,11 +158,42 @@ def explode_bom(sales: pd.DataFrame, bom: pd.DataFrame) -> pd.DataFrame:
     return pd.concat([sales, *extra_rows], ignore_index=True)
 
 
-def load_and_prepare(source_dir: str | Path, today: pd.Timestamp, salt: str | None = None):
-    """Полный конвейер загрузки: читает, валидирует, чистит, разворачивает BOM.
-    Возвращает (data, warnings)."""
+def load_data(
+    source_dir: str | Path,
+    today: pd.Timestamp | None = None,
+    salt: str | None = None,
+):
+    """Полный конвейер загрузки для UI и движка.
+
+    Если дата расчёта не передана, используем последнюю корректную дату продаж.
+    Это делает загрузку файлов самостоятельной, а явный ``today`` по-прежнему
+    доступен для детерминированных расчётов и тестов.
+    """
     raw = load_dir(source_dir)
     warnings = validate(raw)
+    missing_columns = [
+        f"{name}.csv: отсутствует колонка {column}"
+        for name, columns in REQUIRED_COLUMNS.items()
+        for column in columns
+        if column not in raw[name].columns
+    ]
+    if missing_columns:
+        raise ValueError("; ".join(missing_columns))
+    if today is None:
+        parsed_dates = pd.to_datetime(raw["sales"].get("date"), errors="coerce")
+        latest_date = parsed_dates.max()
+        today = (
+            latest_date.normalize()
+            if pd.notna(latest_date)
+            else pd.Timestamp.today().normalize()
+        )
+    else:
+        today = pd.Timestamp(today)
     cleaned = clean(raw, today, salt)
     cleaned["sales"] = explode_bom(cleaned["sales"], cleaned["bom"])
     return cleaned, warnings
+
+
+def load_and_prepare(source_dir: str | Path, today: pd.Timestamp, salt: str | None = None):
+    """Backward-compatible explicit-date entrypoint used by acceptance tests."""
+    return load_data(source_dir, today=today, salt=salt)

@@ -1,5 +1,11 @@
 # TDD evidence: Nikita first checkpoint
 
+> Historical evidence below describes the initial isolated stub checkpoint.
+> After integration with `origin/main` at `e298836`, the team's real generator
+> and forecast engine replace that stub. Old commit IDs are preserved locally
+> under `codex/nikita-core-pre-rebase`; they are not the rebased branch history.
+> Current integration results are recorded at the end of this document.
+
 ## Source and user journey
 
 Source: [`docs/PLAN.md`](../PLAN.md), sections 2, 3, 5, 6 and the 14:00 checkpoint.
@@ -49,3 +55,57 @@ Before review fixes, the four-test suite was also run three consecutive times an
 - `engine.pipeline` alone is below 80% line coverage; combined first-checkpoint coverage is 86%. Filter, validation and series behavior belong to the next contract cycle.
 - RED checkpoints: `1d4b1e4`, `445aa80`, `403accc`.
 - GREEN checkpoints: `430a460`, `1b1d7d6`, `089060f`.
+
+## Integration with the team's implementation
+
+The branch preserves the upstream generator, demand model and forecast model.
+Generator tests now exercise `generate()` in temporary directories and verify
+semantic scenarios, rather than requiring numbers from the superseded stub.
+The upstream generator currently does not supply the earlier `NEW_SKUS` fixture;
+the short-history guarantee above applies only to the historical checkpoint.
+
+Regression tests caught the missing `engine.io.load_data` entrypoint used by the
+UI, a mandatory date argument incompatible with the UI's `sku_series` call,
+and inconsistent chart annotation fields. The integration adds the loader
+entrypoint, makes the chart date optional and returns actual excluded quantities
+and stockout days. Zero-order rows use the agreed `normal` urgency value.
+
+Acceptance tests generate their own temporary CSVs, so stale local demo files
+cannot change the test result. Existing local CSVs are preserved.
+
+Windows test runs use `PYTHONUTF8=1`: an upstream UI test reads a UTF-8 approval
+JSON without specifying its encoding. This avoids the Windows cp1252 default;
+the application already writes approval files explicitly as UTF-8.
+
+The real Streamlit integration test loads fresh CSVs, runs the actual loader,
+recommendation function and chart function, then verifies that a recommendation
+table and Plotly chart appear without a UI exception.
+
+Remaining upstream integration limitations (not covered by a claim of full
+product readiness): the chart caller does not pass the selected calculation
+date/growth, and the live seasonality check requires 12 forecast months whereas
+the chart API defaults to six. The live BOM check also removes kit sales after
+the loader already expanded their components. These checks need a coordinated
+follow-up with the UI owner; automated acceptance tests are a separate suite.
+
+Final verification on 2026-09-23 (Python 3.12, `PYTHONUTF8=1`):
+
+- Full suite: `python -m pytest -q --cov=engine --cov=app --cov=data
+  --cov-report=term --cov-fail-under=80` — 35 passed, 82.94% coverage
+  (this report includes the UI test module).
+- `python -m coverage report --omit='*/tests/*' --fail-under=80`
+  — 81% for application code, threshold passed.
+- Two subsequently added regressions: `python -m pytest -q
+  tests/test_pipeline_contract.py::test_loader_reports_missing_required_column
+  tests/test_pipeline_contract.py::test_real_engine_connects_to_streamlit`
+  — 2 passed. The missing-column case was first reproduced as a TypeError,
+  then changed to a readable ValueError.
+- `python -m compileall -q engine data app tests` — passed.
+- `python -m pip check` — no broken requirements.
+- `python -m pip_audit --local --timeout 15 --progress-spinner off`
+  — no known vulnerabilities after updating local venv pip to 26.2.1.
+- No private IEK spreadsheets, task DOCX, generated CSVs or approval JSONs are
+  tracked. Code review found no HIGH/CRITICAL regression.
+- Standalone server health probing was blocked by the execution environment;
+  UI runtime verification used Streamlit AppTest instead.
+- Lint/typecheck tools are not configured; they were not claimed as passing.
