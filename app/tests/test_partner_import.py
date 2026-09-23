@@ -165,6 +165,36 @@ def test_moq_import_rejects_conflicting_constraints(iek_files):
         backend.load_partner_files(files, settings(), "2026-09-23")
 
 
+def test_moq_import_treats_na_marker_as_missing_constraint(iek_files):
+    missing_moq = (
+        "MOQ ИЭК.xlsx",
+        workbook([
+            ["№", "Код 1с", "Артикул поставщика", "Наименование", "Мин. разр. к отгр."],
+            [1, "001_", "ARTICLE-01", "Кабель тестовый", "#N/A"],
+        ]),
+    )
+    files = (*iek_files[:2], missing_moq, iek_files[3])
+
+    data, warnings = backend.load_partner_files(files, settings(), "2026-09-23")
+
+    assert data["products"].iloc[0].moq == 0
+    assert any("1 значение #N/A" in warning for warning in warnings)
+
+
+def test_moq_import_still_rejects_unknown_text_constraint(iek_files):
+    invalid_moq = (
+        "MOQ ИЭК.xlsx",
+        workbook([
+            ["№", "Код 1с", "Артикул поставщика", "Наименование", "Мин. разр. к отгр."],
+            [1, "001_", "ARTICLE-01", "Кабель тестовый", "неизвестно"],
+        ]),
+    )
+    files = (*iek_files[:2], invalid_moq, iek_files[3])
+
+    with pytest.raises(ValueError, match="нечисловое"):
+        backend.load_partner_files(files, settings(), "2026-09-23")
+
+
 def test_movements_sign_aggregation_and_no_double_count(iek_files):
     movement = ("Динамика продаж_2025-2026.xlsx", workbook([
         ["Дата", "Номер", "Документ", "Код", "Номенклатура", "Ед.", "Склад", "Количество"],
