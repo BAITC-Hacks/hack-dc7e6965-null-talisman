@@ -77,7 +77,7 @@ def test_reference_skus_encode_demo_scenarios(tmp_path: Path) -> None:
         .merge(suppliers, on="supplier_id", validate="many_to_one")
     )
     assert int(critical.iloc[0]["lead_time_days"]) >= 30
-    assert stock.loc[stock["sku"] == "DEMO-CRITICAL", "on_hand"].max() <= 15
+    assert stock.loc[stock["sku"] == "DEMO-CRITICAL", "on_hand"].max() <= 5
 
     outage = stockouts.loc[stockouts["sku"] == "DEMO-STOCKOUT"].iloc[0]
     outage_sales = sales.loc[
