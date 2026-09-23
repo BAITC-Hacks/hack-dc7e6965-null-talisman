@@ -244,7 +244,17 @@ def test_inspection_rejects_package_above_total_budget(monkeypatch, iek_files):
         raising=False,
     )
 
-    with pytest.raises(ValueError, match="общий размер"):
+    with pytest.raises(ValueError, match="[Оо]бщий размер"):
+        inspect_files(iek_files)
+
+    monkeypatch.setattr(partner_import, "MAX_TOTAL_FILE_BYTES", 200 * 1024 * 1024)
+    monkeypatch.setattr(partner_import, "MAX_TOTAL_EXPANDED_BYTES", 100)
+    with pytest.raises(ValueError, match="[Оо]бщий размер XLSX после распаковки"):
+        inspect_files(iek_files)
+
+    monkeypatch.setattr(partner_import, "MAX_TOTAL_EXPANDED_BYTES", 512 * 1024 * 1024)
+    monkeypatch.setattr(partner_import, "MAX_TOTAL_ARCHIVE_MEMBERS", 1)
+    with pytest.raises(ValueError, match="комплекте слишком много частей"):
         inspect_files(iek_files)
 
 
@@ -270,6 +280,11 @@ def test_import_rejects_worksheet_above_cell_budget(monkeypatch, iek_files):
     reports = inspect_files(iek_files)
 
     with pytest.raises(ValueError, match="слишком много ячеек"):
+        convert_files(iek_files, reports, settings(), "2026-09-23")
+
+    monkeypatch.setattr(partner_import, "MAX_SHEET_CELLS", 10_000_000)
+    monkeypatch.setattr(partner_import, "MAX_TOTAL_CELLS", 1)
+    with pytest.raises(ValueError, match="общий бюджет"):
         convert_files(iek_files, reports, settings(), "2026-09-23")
 
 

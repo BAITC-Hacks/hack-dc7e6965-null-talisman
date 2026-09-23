@@ -10,6 +10,7 @@ import re
 from dataclasses import dataclass
 from itertools import islice
 from pathlib import Path
+from zipfile import BadZipFile, ZipFile
 
 import numpy as np
 import pandas as pd
@@ -26,6 +27,17 @@ MONTHS = {name: i for i, name in enumerate(
 # Two supplied IEK reports omit the brand in the original filename.
 IEK_FILENAMES = {"динамика продаж_2025-2026.xlsx",
                  "ежемесячные продажи в количественном выражении за последние 2 года.xlsx"}
+MAX_FILES = 16
+MAX_FILE_BYTES = 50 * 1024 * 1024
+MAX_EXPANDED_BYTES = 256 * 1024 * 1024
+MAX_ARCHIVE_MEMBERS = 2048
+MAX_TOTAL_FILE_BYTES = 200 * 1024 * 1024
+MAX_TOTAL_EXPANDED_BYTES = 512 * 1024 * 1024
+MAX_TOTAL_ARCHIVE_MEMBERS = 8192
+MAX_DATA_ROWS = 250_000
+MAX_COLUMNS = 512
+MAX_SHEET_CELLS = 10_000_000
+MAX_TOTAL_CELLS = 20_000_000
 
 
 def text(value):
@@ -58,6 +70,31 @@ class Report:
     headers: tuple[str, ...]
 
 
+def _archive_stats(filename, content):
+    if len(content) > MAX_FILE_BYTES:
+        raise ValueError(f"{filename}: XLSX слишком большой; максимум {MAX_FILE_BYTES // (1024 * 1024)} МБ.")
+    try:
+        with ZipFile(io.BytesIO(content)) as archive:
+            members = archive.infolist()
+            if len(members) > MAX_ARCHIVE_MEMBERS:
+                raise ValueError(f"{filename}: слишком много частей внутри XLSX.")
+            if sum(member.file_size for member in members) > MAX_EXPANDED_BYTES:
+                raise ValueError(
+                    f"{filename}: XLSX слишком большой после распаковки; "
+                    f"максимум {MAX_EXPANDED_BYTES // (1024 * 1024)} МБ."
+                )
+            return len(members), sum(member.file_size for member in members)
+    except BadZipFile as exc:
+        raise ValueError(
+            f"{filename}: не удалось открыть XLSX. Проверьте, что файл не повреждён и не защищён паролем."
+        ) from exc
+
+
+def _validated_stream(filename, content):
+    _archive_stats(filename, content)
+    return io.BytesIO(content)
+
+
 def _kind(headers):
     h = set(headers)
     if {"дата", "документ", "код", "количество", "склад"} <= h:
@@ -76,7 +113,16 @@ def _kind(headers):
 
 
 def inspect_files(files: tuple) -> list[Report]:
+    if len(files) > MAX_FILES:
+        raise ValueError(f"Загрузите не более {MAX_FILES} XLSX за один раз.")
+    total_file_bytes = sum(len(content) for _, content in files)
+    if total_file_bytes > MAX_TOTAL_FILE_BYTES:
+        raise ValueError(
+            f"Общий размер XLSX слишком большой; максимум {MAX_TOTAL_FILE_BYTES // (1024 * 1024)} МБ."
+        )
     reports = []
+    total_members = 0
+    total_expanded_bytes = 0
     for filename, content in files:
         if Path(filename).suffix.lower() != ".xlsx":
             raise ValueError("Отчёты партнёра загружаются в XLSX. Подготовленные CSV загружайте отдельно.")
@@ -87,12 +133,26 @@ def inspect_files(files: tuple) -> list[Report]:
         if not brand:
             raise ValueError(f"{filename}: укажите ИЭК или Systeme в имени файла, чтобы определить поставщика.")
         try:
-            book = load_workbook(io.BytesIO(content), read_only=True, data_only=True)
+            member_count, expanded_bytes = _archive_stats(filename, content)
+            total_members += member_count
+            total_expanded_bytes += expanded_bytes
+            if total_members > MAX_TOTAL_ARCHIVE_MEMBERS:
+                raise ValueError("В загруженном комплекте слишком много частей XLSX.")
+            if total_expanded_bytes > MAX_TOTAL_EXPANDED_BYTES:
+                raise ValueError(
+                    "Общий размер XLSX после распаковки слишком большой; "
+                    f"максимум {MAX_TOTAL_EXPANDED_BYTES // (1024 * 1024)} МБ."
+                )
+            book = load_workbook(
+                io.BytesIO(content), read_only=True, data_only=True, keep_links=False
+            )
             found = False
             try:
                 for sheet in book:
                     sheet.reset_dimensions()  # Some 1C exports declare only H171605 as their dimension.
                     for rownum, row in enumerate(islice(sheet.iter_rows(values_only=True), 12), 1):
+                        if len(row) > MAX_COLUMNS:
+                            raise ValueError(f"{filename}: слишком много столбцов; максимум {MAX_COLUMNS}.")
                         headers = tuple(norm(v) for v in row)
                         kind = _kind(headers)
                         if kind:
@@ -125,16 +185,93 @@ def missing_reports(reports):
     return missing
 
 
-def _read(report, contents):
-    book = load_workbook(io.BytesIO(contents[report.filename]), read_only=True, data_only=True)
+def _numeric_column_indexes(report):
+    if report.kind == "movements":
+        names = {"количество"}
+    elif report.kind == "moq":
+        names = {"кратность", "мин. разр. к отгр."}
+    else:
+        names = set()
+        for header in report.headers:
+            if month(header) is not None:
+                names.add(header)
+            if report.kind in {"transit", "overview"} and (
+                "поступление до" in header or header.startswith("сэ в пути")
+            ):
+                names.add(header)
+        if report.kind == "overview":
+            names.add("свободный остаток")
+    return tuple(index for index, header in enumerate(report.headers) if header in names)
+
+
+def _reject_uncached_numeric_formulas(report, content, value_rows):
+    numeric_indexes = _numeric_column_indexes(report)
+    if not numeric_indexes or not value_rows:
+        return
+    book = load_workbook(
+        _validated_stream(report.filename, content),
+        read_only=True,
+        data_only=False,
+        keep_links=False,
+    )
     try:
         sheet = book[report.sheet]
         sheet.reset_dimensions()
-        rows = sheet.iter_rows(min_row=report.header_row + 1, max_col=len(report.headers), values_only=True)
+        formula_rows = sheet.iter_rows(
+            min_row=report.header_row + 1,
+            max_row=report.header_row + len(value_rows),
+            max_col=len(report.headers),
+        )
+        for row_number, (formula_row, value_row) in enumerate(
+            zip(formula_rows, value_rows), report.header_row + 1
+        ):
+            for index in numeric_indexes:
+                if formula_row[index].data_type == "f" and text(value_row[index]) == "":
+                    raise ValueError(
+                        f"{report.filename}: формула без сохранённого числового значения "
+                        f"в строке {row_number}, столбце «{report.headers[index]}». "
+                        "Пересчитайте и сохраните книгу перед загрузкой."
+                    )
+    finally:
+        book.close()
+
+
+def _read(report, contents, remaining_cells=MAX_TOTAL_CELLS):
+    book = load_workbook(
+        _validated_stream(report.filename, contents[report.filename]),
+        read_only=True,
+        data_only=True,
+        keep_links=False,
+    )
+    try:
+        sheet = book[report.sheet]
+        sheet.reset_dimensions()
+        column_count = max(1, len(report.headers))
+        sheet_cell_rows = MAX_SHEET_CELLS // column_count
+        total_cell_rows = remaining_cells // column_count
+        row_limit = min(MAX_DATA_ROWS, sheet_cell_rows, total_cell_rows)
+        row_iterator = sheet.iter_rows(
+            min_row=report.header_row + 1, max_col=len(report.headers), values_only=True
+        )
+        rows = list(islice(row_iterator, row_limit + 1))
+        if len(rows) > row_limit:
+            if row_limit == sheet_cell_rows:
+                raise ValueError(
+                    f"{report.filename}: слишком много ячеек данных; максимум {MAX_SHEET_CELLS}."
+                )
+            if row_limit == total_cell_rows:
+                raise ValueError(
+                    f"Комплект XLSX превышает общий бюджет {MAX_TOTAL_CELLS} ячеек данных."
+                )
+            raise ValueError(
+                f"{report.filename}: слишком много строк данных; максимум {MAX_DATA_ROWS}."
+            )
         # Empty/duplicate unnamed columns are retained by position until headers are selected.
         frame = pd.DataFrame(rows, columns=[v or f"_empty_{i}" for i, v in enumerate(report.headers)])
     finally:
         book.close()
+    _reject_uncached_numeric_formulas(report, contents[report.filename], rows)
+    source_cell_count = len(rows) * len(report.headers)
     code = next((c for c in ("код 1с", "номенклатура.код", "код") if c in frame), None)
     if code is None:
         raise ValueError(f"{report.filename}: нет кода товара.")
@@ -163,6 +300,7 @@ def _read(report, contents):
             frame.attrs["duplicate_moq_rows_removed"] = original_count - len(frame)
     if report.kind != "movements" and frame.sku.duplicated().any():
         raise ValueError(f"{report.filename}: код товара повторяется; уточните структуру, чтобы не удвоить объём.")
+    frame.attrs["source_cell_count"] = source_cell_count
     return frame
 
 
@@ -206,6 +344,7 @@ def convert_files(files, reports, settings, today):
         "Пустые количества внутри отчётов приняты за 0. Текущий незавершённый месяц не используется для обучения.",
         "Единицы покупки и хранения не пересчитываются (например, бухты → метры). Проверьте кратность перед утверждением.",
     ]
+    total_cells_read = 0
     for brand in sorted({r.brand for r in reports}):
         chosen = {r.kind: r for r in reports if r.brand == brand and r.kind != "season"}
         config = settings.get(brand, {})
@@ -216,18 +355,23 @@ def convert_files(files, reports, settings, today):
         sales_kind = next(k for k in ("sales", "movements", "overview") if k in chosen)
         stock_kind = "overview" if "overview" in chosen else "stock"
         needed = {sales_kind, stock_kind} | ({"moq", "transit", "stock"} & chosen.keys())
-        frames = {k: _read(chosen[k], contents) for k in needed}
+        frames = {}
+        for kind in needed:
+            frame = _read(chosen[kind], contents, MAX_TOTAL_CELLS - total_cells_read)
+            total_cells_read += int(frame.attrs.get("source_cell_count", 0))
+            frames[kind] = frame
         duplicate_transit_rows = sum(
             int(frame.attrs.get("exact_duplicate_rows_removed", 0)) for frame in frames.values()
         )
         if duplicate_transit_rows == 1:
             warnings.append(
-                f"{BRANDS[brand]}: удалена 1 полностью совпадающая строка поставки, чтобы не удвоить объём."
+                f"{BRANDS[brand]}: удалена 1 полностью совпадающая строка поставки после нормализации, "
+                "чтобы не удвоить объём."
             )
         elif duplicate_transit_rows > 1:
             warnings.append(
-                f"{BRANDS[brand]}: удалено {duplicate_transit_rows} полностью совпадающих строк поставки, "
-                "чтобы не удвоить объём."
+                f"{BRANDS[brand]}: удалено {duplicate_transit_rows} полностью совпадающих строк поставки "
+                "после нормализации, чтобы не удвоить объём."
             )
         duplicate_moq_rows = sum(
             int(frame.attrs.get("duplicate_moq_rows_removed", 0)) for frame in frames.values()
@@ -305,7 +449,12 @@ def convert_files(files, reports, settings, today):
         if "moq" in frames:
             mf = frames["moq"].set_index("sku")
             column = "кратность" if "кратность" in mf else "мин. разр. к отгр."
-            missing_marker = mf[column].map(text).str.upper().eq("#N/A")
+            known_iek_missing_marker = brand == "IEK" and column == "мин. разр. к отгр."
+            missing_marker = (
+                mf[column].map(text).str.upper().eq("#N/A")
+                if known_iek_missing_marker
+                else pd.Series(False, index=mf.index)
+            )
             values = _numbers(mf[column].mask(missing_marker, ""), column, True)
             missing_count = int(missing_marker.sum())
             if missing_count:
@@ -313,7 +462,7 @@ def convert_files(files, reports, settings, today):
                 noun = "значение" if missing_count == 1 else "значений"
                 warnings.append(
                     f"{BRANDS[brand]}: {missing_count} {noun} #N/A принято как отсутствие ограничения; "
-                    f"используется {default}."
+                    f"используется {default}. Проверьте эти товары перед утверждением заказа."
                 )
             if (values % 1 != 0).any():
                 raise ValueError("Дробная кратность/MOQ не поддерживается целочисленным заказом. Уточните единицы измерения.")
