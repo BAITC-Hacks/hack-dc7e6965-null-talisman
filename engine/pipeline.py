@@ -36,6 +36,8 @@ def _empty_result() -> pd.DataFrame:
 
 def _build_context(data: dict[str, pd.DataFrame], today: pd.Timestamp) -> dict:
     sales = data["sales"]
+    # Also respect the cutoff for callers that pass an already-loaded dataset.
+    sales = sales.loc[sales["date"] <= today].copy()
     trimmed_lines, oneoff_events = demand.detect_and_trim_oneoffs(sales)
     monthly = demand.monthly_clean_series(trimmed_lines, data["stockouts"], today)
     category_seasonal = forecast.build_category_seasonal(monthly, data["products"])
@@ -247,9 +249,10 @@ def sku_series(data: dict[str, pd.DataFrame], sku: str, warehouse: str,
             "stockout_days": int(round((1.0 - float(r["availability_frac"])) * r["month"].days_in_month)),
         })
 
-    last_month = series["month"].max() if not series.empty else today.to_period("M") - 1
-    for h in range(1, forward_months + 1):
-        m = last_month + h
+    # Match replenish.forecast_over_horizon: the calculation month has h=0.
+    # Anchor to the selected date, even when the last sale was months ago.
+    for h in range(forward_months):
+        m = today.to_period("M") + h
         val = forecast.forecast_month_value(model, h, m.month, growth_pct)
         out_rows.append({
             "month": str(m), "raw": None, "clean": None, "forecast": float(val),

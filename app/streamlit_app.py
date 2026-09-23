@@ -68,7 +68,9 @@ def position_card(frame, data, key):
     if row.get("flags"):
         st.caption(f"Особенности расчёта: {row['flags']}")
     try:
-        st.plotly_chart(demand_chart(series(data, row.sku, row.warehouse)), width="stretch", key=f"chart_{key}")
+        chart_series = series(data, row.sku, row.warehouse,
+                              st.session_state.calculation_params["today"], float(row.get("growth_pct", 0)))
+        st.plotly_chart(demand_chart(chart_series), width="stretch", key=f"chart_{key}")
         st.caption("Серый — факт, синий — очищенный спрос, пунктир — прогноз. Красные точки — разовый сверхобъём; оранжевый фон — месяцы отсутствия товара.")
     except Exception as exc:
         show_error(exc)
@@ -82,6 +84,7 @@ saved = st.session_state.get("calculation_params", {})
 data, files = None, ()
 with st.sidebar:
     st.header("Параметры расчёта")
+    today = st.date_input("Дата расчёта", value=date.fromisoformat(saved.get("today", "2026-09-23")))
     source_options = ["Демонстрационные данные", "Загрузить файлы"]
     source = st.radio("Источник данных", source_options,
                       index=source_options.index(st.session_state.get("saved_source", source_options[0])))
@@ -106,7 +109,7 @@ with st.sidebar:
             show_error(exc)
     if files:
         try:
-            data, warnings = load_files(files)
+            data, warnings = load_files(files, today.isoformat())
             for warning in warnings:
                 st.warning(str(warning))
         except Exception as exc:
@@ -121,7 +124,6 @@ with st.sidebar:
                             index=category_options.index(saved.get("category")) if saved.get("category") in category_options else 0,
                             format_func=lambda value: value or "Все категории")
     service = st.select_slider("Уровень сервиса", options=[.90, .95, .98], value=saved.get("service_level", .95), format_func=lambda value: f"{value:.0%}")
-    today = st.date_input("Дата расчёта", value=date.fromisoformat(saved.get("today", "2026-09-23")))
     growth = {}
     with st.expander("Дополнительный прирост по категориям"):
         st.caption("Контракты и промо сверх выявленного тренда. 0% не отменяет рост из истории.")
@@ -214,7 +216,7 @@ for supplier, group in positive.groupby("supplier_id", sort=False):
         for _, row in changed.iterrows():
             st.caption(f"Изменено вручную: {row.sku} / {row.warehouse}: {row.original_qty:g} → {row.recommended_qty:g} шт.")
         st.caption(f"Текущий заказ: {(draft.recommended_qty > 0).sum()} позиций, {draft.recommended_qty.sum():,.0f} шт. Нулевые количества не попадут в выгрузку.")
-        with st.expander("Обоснование и история спроса"):
+        if st.checkbox("Показать обоснование и график", key=f"show_card_{key}"):
             position_card(group, st.session_state.calculation_data, key)
         approved = st.session_state.approvals.get(str(supplier))
         if approved and approved["fingerprint"] != fingerprint(draft):

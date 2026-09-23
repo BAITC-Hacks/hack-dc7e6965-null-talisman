@@ -46,7 +46,7 @@ def connected(monkeypatch, result, tmp_path):
         "growth": pd.DataFrame(columns=["category", "growth_pct"]),
     }
     monkeypatch.setattr(backend, "demo_files", lambda: (("sales.csv", b"test-fixture"),))
-    monkeypatch.setattr(backend, "load_files", lambda files: (tables, []))
+    monkeypatch.setattr(backend, "load_files", lambda files, today=None: (tables, []))
     monkeypatch.setattr(backend, "calculate", lambda data, params: result.copy())
     monkeypatch.setattr(backend, "series", lambda *args: pd.DataFrame({
         "month": ["2026-07-01", "2026-08-01", "2026-09-01"],
@@ -71,7 +71,7 @@ def test_approval_export_and_immutable_history(result, tmp_path):
     assert approved["fingerprint"] == orders.fingerprint(draft)
     orders.approve(draft, "Амир", {}, tmp_path)
     assert len(list(tmp_path.glob("*.json"))) == 2
-    assert json.loads(next(tmp_path.glob("*.json")).read_text())["author"] == "Амир"
+    assert json.loads(next(tmp_path.glob("*.json")).read_text(encoding="utf-8"))["author"] == "Амир"
     exported = pd.read_csv(io.BytesIO(orders.csv_bytes(draft)), sep=";")
     assert list(exported["Количество"]) == [75]
     assert "100 → 75" in exported.iloc[0]["Обоснование"]
