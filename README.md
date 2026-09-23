@@ -168,23 +168,34 @@ Plotly (графики), openpyxl (XLSX), pytest и pytest-cov (тесты).
 их записи в Git не включены. Внешние модели и LLM API не используются. При разработке
 использованы AI coding tools.
 
-## История интеграции
+## Проверенный запуск
 
-Работа из ветки `codex/nikita-core` включена в `main`: загрузчик и графики движка соединены с UI команды.
-Используются реальные модули расчёта из `main`; первоначальная заглушка заменена.
-Инструкции интерфейса: [app/README.md](app/README.md).
-
-Проверено в локальном Python 3.12 с зависимостями из `requirements.txt`.
-Команды PowerShell из корня репозитория:
+Интерфейс использует настоящее ядро расчёта; инструкции и ручной сценарий
+описаны в [app/README.md](app/README.md). Команды Windows PowerShell из корня
+репозитория:
 
 ```powershell
+py -3 -m venv .venv
 $env:PYTHONUTF8 = '1'
+.\.venv\Scripts\python.exe -m pip install -r requirements.txt
+.\.venv\Scripts\python.exe -m streamlit run app/streamlit_app.py
 .\.venv\Scripts\python.exe -m pytest -q
 ```
 
-Тест чтения журнала использует UTF-8 явно; настройка выше оставлена как рабочий пример окружения Windows.
-Приёмочные тесты создают свежие данные во временном каталоге; содержимое
-локального `data/demo/` не влияет на них. Генератор и исходные материалы
-заказчика в этой интеграции не перезаписываются.
+macOS:
 
-История проверок: [TDD evidence](docs/tdd/nikita-first-checkpoint.tdd.md).
+```bash
+python3 -m venv .venv
+./.venv/bin/python -m pip install -r requirements.txt
+./.venv/bin/python -m streamlit run app/streamlit_app.py
+./.venv/bin/python -m pytest -q
+```
+
+На macOS с Python 3.13 проверены установка зависимостей, 71 тест, запуск
+Streamlit и расчёт. На Windows с Python 3.14.7 проверены установка, генерация
+демоданных, 76 тестов, запуск Streamlit, расчёт, утверждение и открытие XLSX.
+Приёмочные тесты создают свежие данные во временном каталоге, поэтому локальные
+`data/demo/` и исходные материалы партнёра не изменяются.
+
+Результаты проверок: [первая контрольная точка](docs/tdd/nikita-first-checkpoint.tdd.md)
+и [ускорение расчёта](docs/tdd/nikita-performance-p0.tdd.md).

@@ -19,3 +19,7 @@ data/orders/*.json
 *.log
 .DS_Store
 Thumbs.db
+
+# Local organizer and partner source materials; never commit raw workbooks.
+/IEK/
+/HackAlem AI_*.docx
