@@ -7,8 +7,12 @@ import pandas as pd
 import plotly.express as px
 import streamlit as st
 
+from app.theme import apply_theme, theme_toggle
+
 st.set_page_config(page_title="Аналитика · Null Talisman", page_icon="📈", layout="wide")
 st.session_state.ui_page = "analytics"
+theme_toggle()
+apply_theme()
 st.caption("NULL TALISMAN / СПРОС")
 st.title("Спрос по категориям")
 if "calculation_data" not in st.session_state:

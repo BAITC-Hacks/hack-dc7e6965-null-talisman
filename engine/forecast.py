@@ -19,19 +19,51 @@ LEVEL_WINDOW_MONTHS = 6
 BACKTEST_MONTHS = 3
 
 
+def _centered_rolling_mean(values: np.ndarray, window: int) -> np.ndarray:
+    """То же самое, что pandas .rolling(window, center=True).mean(), но на чистом
+    numpy через префиксные суммы — без построения pandas Series/Index на каждый
+    вызов. Проверено на совпадение с pandas поэлементно (см. коммит):
+    для чётного окна pandas берёт [i - window//2, i + window//2 - 1]."""
+    n = len(values)
+    result = np.full(n, np.nan)
+    left = window // 2
+    right = window // 2 - 1
+    if n < window:
+        return result
+    csum_padded = np.concatenate(([0.0], np.cumsum(values)))
+    idx = np.arange(left, n - right)
+    sums = csum_padded[idx + right + 1] - csum_padded[idx - left]
+    result[idx] = sums / window
+    return result
+
+
 def _seasonal_ratio_to_cma(series: pd.Series) -> dict[int, float]:
     """series индексирован последовательными помесячными Period. Возвращает
-    {месяц_года(1-12): фактор}, среднее = 1, клип [SEASON_MIN, SEASON_MAX]."""
+    {месяц_года(1-12): фактор}, среднее = 1, клип [SEASON_MIN, SEASON_MAX].
+
+    forecast_sku() вызывает эту функцию дважды на каждый sku (полный ряд +
+    train-часть для честного backtest), поэтому на ~300 sku набегает под 1000
+    вызовов на маленьких (≤36 элементов) рядах — конструирование pandas Series
+    на каждый вызов само по себе занимало заметную долю времени recommend().
+    Здесь всё считается на чистых numpy-массивах, pandas-индекс месяца
+    вычисляется один раз."""
     if len(series) < 13:
         return {m: 1.0 for m in range(1, 13)}
-    cma = series.rolling(12, center=True).mean()
-    ratio = (series / cma).replace([np.inf, -np.inf], np.nan)
-    # groupby(month) вместо питоновского цикла по 12 месяцам с построчным
-    # сравнением Period.month — тот вариант доминировал в профиле recommend()
-    grouped = ratio.groupby(ratio.index.month).mean()
-    by_month = {m: (float(grouped[m]) if m in grouped.index and pd.notna(grouped[m]) else 1.0) for m in range(1, 13)}
-    mean_factor = np.mean(list(by_month.values())) or 1.0
-    return {m: float(np.clip(v / mean_factor, SEASON_MIN, SEASON_MAX)) for m, v in by_month.items()}
+    months = series.index.month.to_numpy()
+    values = series.to_numpy(dtype=float)
+    cma = _centered_rolling_mean(values, 12)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        ratio = values / cma
+    ratio[~np.isfinite(ratio)] = np.nan
+
+    by_month = np.ones(13)
+    for m in range(1, 13):
+        vals = ratio[months == m]
+        vals = vals[~np.isnan(vals)]
+        if len(vals):
+            by_month[m] = vals.mean()
+    mean_factor = by_month[1:].mean() or 1.0
+    return {m: float(np.clip(by_month[m] / mean_factor, SEASON_MIN, SEASON_MAX)) for m in range(1, 13)}
 
 
 def build_category_seasonal(monthly_clean: pd.DataFrame, products: pd.DataFrame) -> dict[str, dict[int, float]]:

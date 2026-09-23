@@ -16,6 +16,7 @@ from app.backend import TABLES, calculate, demo_files, engine_revision, load_fil
 from app.partner_ui import render_import
 from app.charts import demand_chart
 from app.orders import approve, csv_bytes, edited_order, fingerprint, xlsx_bytes
+from app.theme import apply_theme, theme_toggle
 
 st.set_page_config(page_title="Заказы поставщикам · Null Talisman", page_icon="📦", layout="wide")
 LOG = logging.getLogger(__name__)
@@ -23,6 +24,8 @@ if st.session_state.get("ui_page") != "orders" and "result" in st.session_state:
     st.session_state.generation = st.session_state.get("generation", 0) + 1
     st.session_state.editor_inputs = {}
 st.session_state.ui_page = "orders"
+theme_toggle()
+apply_theme()
 URGENCY = {"critical": "🔴 Критично", "high": "🟠 Высокая", "normal": "🟢 Планово"}
 CONFIDENCE = {"high": "Высокая", "medium": "Средняя", "low": "Низкая"}
 

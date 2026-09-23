@@ -8,9 +8,12 @@ import pandas as pd
 import streamlit as st
 
 from app.checks import SCENARIOS, run_checks
+from app.theme import apply_theme, theme_toggle
 
 st.set_page_config(page_title="Проверки · Null Talisman", page_icon="🧪", layout="wide")
 st.session_state.ui_page = "checks"
+theme_toggle()
+apply_theme()
 st.caption("NULL TALISMAN / ПРОВЕРКА РЕШЕНИЯ")
 st.title("Пять требований — пять живых проверок")
 st.write("Сравниваем результат ядра до и после изменения входных данных. Проверки используют копии таблиц и не меняют ваши заказы.")
