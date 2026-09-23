@@ -152,7 +152,7 @@ def recommend(data: dict[str, pd.DataFrame], params: dict | None = None) -> pd.D
             stockout_date = (today + pd.Timedelta(days=days_of_cover)).strftime("%d.%m.%Y")
 
         if recommended_qty == 0:
-            urgency = "none"
+            urgency = "normal"
         elif days_of_cover < lead_time:
             urgency = "critical"
         elif avg_daily > 0 and (on_hand + in_transit_qty) / avg_daily < h_days:
@@ -228,9 +228,10 @@ def sku_series(data: dict[str, pd.DataFrame], sku: str, warehouse: str,
     Колонки: month, raw, clean, forecast, oneoff (исключено шт. за месяц),
     stockout_days (дней без товара за месяц). today=None -> берём последнюю
     дату продаж в данных (карточка в UI вызывается без даты расчёта)."""
-    sales = data.get("sales")
     if today is None:
-        today = sales["date"].max() if sales is not None and not sales.empty else pd.Timestamp.now()
+        sales_dates = pd.to_datetime(data.get("sales", pd.DataFrame()).get("date"), errors="coerce")
+        latest_date = sales_dates.max() if sales_dates is not None else pd.NaT
+        today = latest_date if pd.notna(latest_date) else pd.Timestamp.today().normalize()
     today = pd.Timestamp(today)
     ctx = _build_context(data, today)
     products = data["products"]
@@ -243,24 +244,27 @@ def sku_series(data: dict[str, pd.DataFrame], sku: str, warehouse: str,
     series = ctx["monthly"][(ctx["monthly"]["sku"] == sku) & (ctx["monthly"]["warehouse"] == warehouse)].sort_values("month")
     raw = ctx["raw_monthly"]
     raw = raw[(raw["sku"] == sku) & (raw["warehouse"] == warehouse)] if not raw.empty else raw
-    oneoff_events = ctx["oneoff_events"]
-    oneoff_events = oneoff_events[(oneoff_events["sku"] == sku) & (oneoff_events["warehouse"] == warehouse)] if not oneoff_events.empty else oneoff_events
 
     model = forecast.forecast_sku(series, category_index, growth_pct)
+
+    oneoff_events = ctx["oneoff_events"]
+    if not oneoff_events.empty:
+        oneoff_events = oneoff_events[
+            (oneoff_events["sku"] == sku) & (oneoff_events["warehouse"] == warehouse)
+        ].copy()
+        oneoff_events["month"] = oneoff_events["date"].dt.to_period("M")
+        oneoff_by_month = oneoff_events.groupby("month")["excluded_qty"].sum()
+    else:
+        oneoff_by_month = pd.Series(dtype=float)
 
     out_rows = []
     for _, r in series.iterrows():
         month = r["month"]
         raw_val = raw[raw["month"] == month]["qty"].sum() if raw is not None and not raw.empty else r["actual"]
-        oneoff_qty = 0.0
-        if oneoff_events is not None and not oneoff_events.empty:
-            in_month = oneoff_events[oneoff_events["date"].dt.to_period("M") == month]
-            oneoff_qty = float(in_month["excluded_qty"].sum())
-        days_in_month = (month.end_time - month.start_time).days + 1
         out_rows.append({
             "month": str(month), "raw": float(raw_val), "clean": float(r["clean"]),
-            "forecast": None, "oneoff": oneoff_qty,
-            "stockout_days": (1 - float(r["availability_frac"])) * days_in_month,
+            "forecast": None, "oneoff": float(oneoff_by_month.get(month, 0.0)),
+            "stockout_days": int(round((1.0 - float(r["availability_frac"])) * month.days_in_month)),
         })
 
     last_month = series["month"].max() if not series.empty else today.to_period("M") - 1
@@ -269,7 +273,10 @@ def sku_series(data: dict[str, pd.DataFrame], sku: str, warehouse: str,
         val = forecast.forecast_month_value(model, h, m.month, growth_pct)
         out_rows.append({
             "month": str(m), "raw": None, "clean": None, "forecast": float(val),
-            "oneoff": 0.0, "stockout_days": 0.0,
+            "oneoff": 0.0, "stockout_days": 0,
         })
 
-    return pd.DataFrame(out_rows)
+    return pd.DataFrame(
+        out_rows,
+        columns=["month", "raw", "clean", "forecast", "oneoff", "stockout_days"],
+    )
