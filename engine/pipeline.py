@@ -29,26 +29,49 @@ DEFAULT_PARAMS = dict(
     review_days=None, growth_override=None,
 )
 
-_EMPTY_MONTHLY_GROUP = pd.DataFrame(
-    columns=["sku", "warehouse", "month", "actual", "availability_frac", "clean", "lost_demand"]
-)
-
-
 def _empty_result() -> pd.DataFrame:
     return pd.DataFrame(columns=RECOMMEND_COLUMNS)
 
 
-def _group_by_sku_warehouse(df: pd.DataFrame) -> dict:
-    """{(sku, warehouse): group} за один проход вместо фильтрации df заново
-    на каждую из ~сотен позиций в основном цикле recommend() — тот вариант
-    был главным источником времени на странице "Проверки" (до 2 минут)."""
-    if df is None or df.empty:
-        return {}
-    return {key: grp for key, grp in df.groupby(["sku", "warehouse"], sort=False)}
+def _filter_skus(frame: pd.DataFrame, skus: set[str]) -> pd.DataFrame:
+    if frame.empty:
+        return frame.copy()
+    return frame.loc[frame["sku"].isin(skus)].copy()
 
 
-def _build_context(data: dict[str, pd.DataFrame], today: pd.Timestamp) -> dict:
-    sales = data["sales"]
+def _scope_context_data(
+    data: dict[str, pd.DataFrame], scope_skus: set[str] | None,
+) -> dict[str, pd.DataFrame]:
+    """Оставляет только данные, влияющие на выбранные SKU.
+
+    Продажи родительских BOM-позиций нужны до ``explode_bom``; после раскрытия
+    они отбрасываются, если сами не входят в scope. Так ранняя фильтрация не
+    меняет спрос компонентов.
+    """
+    if scope_skus is None:
+        return data
+
+    bom = data.get("bom", pd.DataFrame())
+    relevant_bom = (
+        bom.loc[bom["component_sku"].isin(scope_skus)].copy()
+        if not bom.empty else bom.copy()
+    )
+    parent_skus = set(relevant_bom["parent_sku"]) if not relevant_bom.empty else set()
+    sales_skus = scope_skus | parent_skus
+    scoped = {**data}
+    scoped["sales"] = _filter_skus(data["sales"], sales_skus)
+    scoped["products"] = _filter_skus(data["products"], scope_skus)
+    scoped["stockouts"] = _filter_skus(data["stockouts"], scope_skus)
+    scoped["bom"] = relevant_bom
+    return scoped
+
+
+def _build_context(
+    data: dict[str, pd.DataFrame], today: pd.Timestamp,
+    scope_skus: set[str] | None = None,
+) -> dict:
+    context_data = _scope_context_data(data, scope_skus)
+    sales = context_data["sales"]
     if not sales.empty:
         # io.load_data() больше не знает дату расчёта на этапе загрузки, поэтому
         # будущие относительно `today` продажи отбрасываем здесь же (и для тех
@@ -57,10 +80,12 @@ def _build_context(data: dict[str, pd.DataFrame], today: pd.Timestamp) -> dict:
     # BOM разворачиваем на каждый вызов, а не один раз при загрузке: так правки
     # bom.csv/sales.csv (в т.ч. сценарии проверки на странице "Проверки") сразу
     # отражаются в результате.
-    sales = io.explode_bom(sales, data.get("bom", pd.DataFrame()))
+    sales = io.explode_bom(sales, context_data.get("bom", pd.DataFrame()))
+    if scope_skus is not None and not sales.empty:
+        sales = sales.loc[sales["sku"].isin(scope_skus)].copy()
     trimmed_lines, oneoff_events = demand.detect_and_trim_oneoffs(sales)
-    monthly = demand.monthly_clean_series(trimmed_lines, data["stockouts"], today)
-    category_seasonal = forecast.build_category_seasonal(monthly, data["products"])
+    monthly = demand.monthly_clean_series(trimmed_lines, context_data["stockouts"], today)
+    category_seasonal = forecast.build_category_seasonal(monthly, context_data["products"])
     raw_monthly = (
         demand.build_lines(sales).assign(month=lambda d: d["date"].dt.to_period("M"))
         .groupby(["sku", "warehouse", "month"], as_index=False)["qty"].sum()
@@ -72,6 +97,45 @@ def _build_context(data: dict[str, pd.DataFrame], today: pd.Timestamp) -> dict:
         "monthly": monthly,
         "raw_monthly": raw_monthly,
         "category_seasonal": category_seasonal,
+    }
+
+
+def _group_by_pair(frame: pd.DataFrame) -> dict[tuple[str, str], pd.DataFrame]:
+    if frame.empty:
+        return {}
+    return {
+        (sku, warehouse): group
+        for (sku, warehouse), group in frame.groupby(["sku", "warehouse"], sort=False)
+    }
+
+
+def _tail_means_by_pair(
+    groups: dict[tuple[str, str], pd.DataFrame], column: str,
+) -> dict[tuple[str, str], float]:
+    return {
+        pair: float(group.sort_values("month")[column].tail(6).mean())
+        for pair, group in groups.items()
+    }
+
+
+def _oneoff_stats_by_pair(
+    groups: dict[tuple[str, str], pd.DataFrame],
+) -> dict[tuple[str, str], tuple[float, str]]:
+    return {
+        pair: (
+            float(group["excluded_qty"].sum()),
+            group.loc[group["excluded_qty"].idxmax(), "client_id"],
+        )
+        for pair, group in groups.items()
+    }
+
+
+def _stockout_days_by_pair(
+    groups: dict[tuple[str, str], pd.DataFrame],
+) -> dict[tuple[str, str], float]:
+    return {
+        pair: float(((group["end"] - group["start"]).dt.days + 1).sum())
+        for pair, group in groups.items()
     }
 
 
@@ -115,23 +179,36 @@ def recommend(data: dict[str, pd.DataFrame], params: dict | None = None) -> pd.D
     if stock.empty:
         return _empty_result()
 
-    ctx = _build_context(data, today)
+    ctx = _build_context(data, today, set(products["sku"]))
     growth_map = _growth_map(data, p["growth_override"])
     suppliers = data["suppliers"].set_index("supplier_id") if not data["suppliers"].empty else pd.DataFrame()
     products_idx = products.set_index("sku")
     default_season = {m: 1.0 for m in range(1, 13)}
 
-    # Разбиваем один раз на словари {(sku, warehouse): group} вместо того, чтобы
-    # фильтровать полные таблицы заново на каждой из ~сотен позиций ниже.
-    monthly_by_key = _group_by_sku_warehouse(ctx["monthly"])
-    raw_by_key = _group_by_sku_warehouse(ctx["raw_monthly"])
-    oneoff_by_key = _group_by_sku_warehouse(ctx["oneoff_events"])
-    stockouts_by_key = _group_by_sku_warehouse(data["stockouts"])
-    in_transit_by_key = _group_by_sku_warehouse(in_transit)
+    monthly_by_key = _group_by_pair(ctx["monthly"])
+    raw_by_key = _group_by_pair(ctx["raw_monthly"])
+    oneoff_by_key = _group_by_pair(ctx["oneoff_events"])
+    stockouts_by_key = _group_by_pair(data["stockouts"])
+    transit_by_key = _group_by_pair(in_transit)
+    avg_clean_by_key = _tail_means_by_pair(monthly_by_key, "clean")
+    avg_raw_by_key = _tail_means_by_pair(raw_by_key, "qty")
+    lost_demand_by_key = {
+        pair: float(group["lost_demand"].sum())
+        for pair, group in monthly_by_key.items()
+    }
+    oneoff_stats_by_key = _oneoff_stats_by_pair(oneoff_by_key)
+    stockout_days_by_key = _stockout_days_by_pair(stockouts_by_key)
+    transit_eta_by_key = {
+        pair: group["eta"].min()
+        for pair, group in transit_by_key.items()
+    }
+    empty_monthly = ctx["monthly"].iloc[0:0]
+    empty_transit = in_transit.iloc[0:0]
 
     rows = []
     for srow in stock.itertuples(index=False):
         sku, warehouse, on_hand = srow.sku, srow.warehouse, float(srow.on_hand)
+        pair = (sku, warehouse)
         if sku not in products_idx.index:
             continue
         prod = products_idx.loc[sku]
@@ -146,7 +223,7 @@ def recommend(data: dict[str, pd.DataFrame], params: dict | None = None) -> pd.D
             lead_time = float(srec["lead_time_days"])
             order_cycle = float(srec["order_cycle_days"])
 
-        series = monthly_by_key.get((sku, warehouse), _EMPTY_MONTHLY_GROUP)
+        series = monthly_by_key.get(pair, empty_monthly)
         category_index = ctx["category_seasonal"].get(category, default_season)
         growth_pct = float(growth_map.get(category, 0.0))
         model = forecast.forecast_sku(series, category_index, growth_pct)
@@ -154,9 +231,9 @@ def recommend(data: dict[str, pd.DataFrame], params: dict | None = None) -> pd.D
         h_days = replenish.horizon_days(lead_time, p["review_days"], order_cycle)
         fcst_horizon, avg_daily = replenish.forecast_over_horizon(model, today, h_days, growth_pct)
         cutoff = today + pd.Timedelta(days=h_days)
-        transit_rows = in_transit_by_key.get((sku, warehouse))
+        transit_rows = transit_by_key.get(pair, empty_transit)
         in_transit_qty, transit_overdue = replenish.in_transit_for(
-            transit_rows if transit_rows is not None else in_transit.iloc[0:0], sku, warehouse, today, cutoff
+            transit_rows, sku, warehouse, today, cutoff
         )
         safety_stock = replenish.z_score(p["service_level"]) * model["sigma_month"] * math.sqrt(h_days / 30)
         need_raw = fcst_horizon + safety_stock - on_hand - in_transit_qty
@@ -183,27 +260,17 @@ def recommend(data: dict[str, pd.DataFrame], params: dict | None = None) -> pd.D
         else:
             urgency = "normal"
 
-        sku_oneoff = oneoff_by_key.get((sku, warehouse))
-        oneoff_excluded = float(sku_oneoff["excluded_qty"].sum()) if sku_oneoff is not None and not sku_oneoff.empty else 0.0
-        oneoff_client = None
-        if sku_oneoff is not None and not sku_oneoff.empty:
-            biggest = sku_oneoff.loc[sku_oneoff["excluded_qty"].idxmax()]
-            oneoff_client = biggest["client_id"]
-
-        lost_demand_added = float(series["lost_demand"].sum()) if not series.empty else 0.0
-        sku_so = stockouts_by_key.get((sku, warehouse))
-        stockout_days = float(((sku_so["end"] - sku_so["start"]).dt.days + 1).sum()) if sku_so is not None and not sku_so.empty else 0.0
-
-        sku_raw = raw_by_key.get((sku, warehouse))
-        avg_month_raw = float(sku_raw.sort_values("month")["qty"].tail(6).mean()) if sku_raw is not None and not sku_raw.empty else 0.0
-        avg_month_clean = float(series.sort_values("month")["clean"].tail(6).mean()) if not series.empty else model["level"]
+        oneoff_excluded, oneoff_client = oneoff_stats_by_key.get(pair, (0.0, None))
+        lost_demand_added = lost_demand_by_key.get(pair, 0.0)
+        stockout_days = stockout_days_by_key.get(pair, 0.0)
+        avg_month_raw = avg_raw_by_key.get(pair, 0.0)
+        avg_month_clean = avg_clean_by_key.get(pair, model["level"])
 
         next_month = (today + pd.DateOffset(months=1)).month
         season_factor = model["season_index"].get(next_month, 1.0)
 
-        transit_eta = None
-        if transit_rows is not None and not transit_rows.empty:
-            transit_eta = transit_rows.sort_values("eta")["eta"].iloc[0].strftime("%d.%m.%Y")
+        first_eta = transit_eta_by_key.get(pair)
+        transit_eta = first_eta.strftime("%d.%m.%Y") if first_eta is not None else None
 
         flags = list(model.get("flags", []))
         if transit_overdue:
@@ -252,12 +319,16 @@ def sku_series(data: dict[str, pd.DataFrame], sku: str, warehouse: str,
         latest_date = sales_dates.max() if sales_dates is not None else pd.NaT
         today = latest_date if pd.notna(latest_date) else pd.Timestamp.today().normalize()
     today = pd.Timestamp(today)
-    ctx = _build_context(data, today)
     products = data["products"]
     category = None
     prod_match = products[products["sku"] == sku]
     if not prod_match.empty:
         category = prod_match.iloc[0]["category"]
+    if category is not None and pd.notna(category):
+        scope_skus = set(products.loc[products["category"] == category, "sku"])
+    else:
+        scope_skus = {sku}
+    ctx = _build_context(data, today, scope_skus)
     category_index = ctx["category_seasonal"].get(category, {m: 1.0 for m in range(1, 13)})
 
     series = ctx["monthly"][(ctx["monthly"]["sku"] == sku) & (ctx["monthly"]["warehouse"] == warehouse)].sort_values("month")

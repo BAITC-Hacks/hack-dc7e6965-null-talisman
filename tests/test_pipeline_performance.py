@@ -8,7 +8,7 @@ from engine import pipeline
 def _two_category_data() -> dict[str, pd.DataFrame]:
     months = pd.period_range("2024-01", "2026-08", freq="M")
     sales_rows = []
-    for sku, base in (("A-1", 10), ("B-1", 20)):
+    for sku, base, warehouse in (("A-1", 10, "WH1"), ("A-2", 15, "WH2"), ("B-1", 20, "WH1")):
         for index, month in enumerate(months):
             sales_rows.append(
                 {
@@ -17,7 +17,7 @@ def _two_category_data() -> dict[str, pd.DataFrame]:
                     "qty": base + index % 3,
                     "client_id": f"client-{sku}",
                     "price": 100.0,
-                    "warehouse": "WH1",
+                    "warehouse": warehouse,
                 }
             )
 
@@ -26,6 +26,7 @@ def _two_category_data() -> dict[str, pd.DataFrame]:
         "stock": pd.DataFrame(
             [
                 {"sku": "A-1", "warehouse": "WH1", "on_hand": 10},
+                {"sku": "A-2", "warehouse": "WH2", "on_hand": 10},
                 {"sku": "B-1", "warehouse": "WH1", "on_hand": 10},
             ]
         ),
@@ -49,6 +50,14 @@ def _two_category_data() -> dict[str, pd.DataFrame]:
                     "pack_size": 1,
                     "moq": 0,
                 },
+                {
+                    "sku": "A-2",
+                    "name": "Category A second warehouse",
+                    "category": "A",
+                    "supplier_id": "SUP-A",
+                    "pack_size": 1,
+                    "moq": 0,
+                },
             ]
         ),
         "suppliers": pd.DataFrame(
@@ -58,7 +67,9 @@ def _two_category_data() -> dict[str, pd.DataFrame]:
             ]
         ),
         "growth": pd.DataFrame(columns=["category", "growth_pct"]),
-        "bom": pd.DataFrame(columns=["parent_sku", "component_sku", "qty_per"]),
+        "bom": pd.DataFrame(
+            [{"parent_sku": "B-1", "component_sku": "A-1", "qty_per": 2}]
+        ),
     }
 
 
@@ -83,8 +94,8 @@ def test_recommend_builds_context_only_for_selected_category(monkeypatch) -> Non
         {"today": "2026-09-23", "category": "A"},
     )
 
-    assert set(result["sku"]) == {"A-1"}
-    assert captured == [{"A-1"}]
+    assert set(result["sku"]) == {"A-1", "A-2"}
+    assert captured == [{"A-1", "A-2"}]
 
 
 def test_sku_series_builds_context_only_for_target_category(monkeypatch) -> None:
@@ -99,4 +110,25 @@ def test_sku_series_builds_context_only_for_target_category(monkeypatch) -> None
     )
 
     assert not result.empty
-    assert captured == [{"A-1"}]
+    assert captured == [{"A-1", "A-2"}]
+
+
+def test_category_scope_preserves_full_result_values() -> None:
+    data = _two_category_data()
+    params = {"today": "2026-09-23"}
+
+    full = pipeline.recommend(data, params)
+    scoped = pipeline.recommend(data, {**params, "category": "A"})
+    expected = full.loc[full["category"] == "A"].reset_index(drop=True)
+
+    pd.testing.assert_frame_equal(scoped.reset_index(drop=True), expected)
+
+
+def test_scoping_accepts_schema_less_empty_context_tables() -> None:
+    data = _two_category_data()
+    data["sales"] = pd.DataFrame()
+    data["stockouts"] = pd.DataFrame()
+
+    result = pipeline.recommend(data, {"today": "2026-09-23", "category": "A"})
+
+    assert set(result["sku"]) == {"A-1", "A-2"}
