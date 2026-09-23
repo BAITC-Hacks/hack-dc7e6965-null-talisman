@@ -236,6 +236,59 @@ def test_import_rejects_worksheet_above_row_limit(monkeypatch, iek_files):
         convert_files(iek_files, reports, settings(), "2026-09-23")
 
 
+def test_inspection_rejects_package_above_total_budget(monkeypatch, iek_files):
+    monkeypatch.setattr(
+        partner_import,
+        "MAX_TOTAL_FILE_BYTES",
+        sum(len(content) for _, content in iek_files) - 1,
+        raising=False,
+    )
+
+    with pytest.raises(ValueError, match="общий размер"):
+        inspect_files(iek_files)
+
+
+def test_inspection_rejects_file_count_members_and_columns(monkeypatch, iek_files):
+    filename, content = iek_files[-1]
+    monkeypatch.setattr(partner_import, "MAX_FILES", 0)
+    with pytest.raises(ValueError, match="не более"):
+        inspect_files(((filename, content),))
+
+    monkeypatch.setattr(partner_import, "MAX_FILES", 16)
+    monkeypatch.setattr(partner_import, "MAX_ARCHIVE_MEMBERS", 1)
+    with pytest.raises(ValueError, match="слишком много частей"):
+        inspect_files(((filename, content),))
+
+    monkeypatch.setattr(partner_import, "MAX_ARCHIVE_MEMBERS", 2048)
+    monkeypatch.setattr(partner_import, "MAX_COLUMNS", 1)
+    with pytest.raises(ValueError, match="слишком много столбцов"):
+        inspect_files(((filename, content),))
+
+
+def test_import_rejects_worksheet_above_cell_budget(monkeypatch, iek_files):
+    monkeypatch.setattr(partner_import, "MAX_SHEET_CELLS", 1, raising=False)
+    reports = inspect_files(iek_files)
+
+    with pytest.raises(ValueError, match="слишком много ячеек"):
+        convert_files(iek_files, reports, settings(), "2026-09-23")
+
+
+def test_import_rejects_formula_without_cached_numeric_value():
+    files = (
+        ("Продажи ИЭК.xlsx", workbook([
+            ["Номенклатура", "Номенклатура.Код", "янв. 2026", "июль 2026", "авг. 2026"],
+            ["Тест", "001_", 100, "=1+1", 20],
+        ])),
+        ("Остатки ИЭК.xlsx", workbook([
+            ["Номенклатура", "Номенклатура.Код", "Ед.", "сент. 2026"],
+            ["Тест", "001_", "шт", 2],
+        ])),
+    )
+
+    with pytest.raises(ValueError, match="формула без сохранённого числового значения"):
+        backend.load_partner_files(files, settings(), "2026-09-23")
+
+
 def test_movements_sign_aggregation_and_no_double_count(iek_files):
     movement = ("Динамика продаж_2025-2026.xlsx", workbook([
         ["Дата", "Номер", "Документ", "Код", "Номенклатура", "Ед.", "Склад", "Количество"],
