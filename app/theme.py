@@ -157,6 +157,9 @@ code, .stCodeBlock, [data-testid="stMetricValue"],
   box-shadow: none;
   transition: background-color 120ms ease-out, border-color 120ms ease-out;
 }
+[data-testid="stBaseButton-primary"] *, .stButton > button[kind="primary"] * {
+  color: var(--nt-accent-ink) !important;
+}
 [data-testid="stBaseButton-primary"]:hover, .stButton > button[kind="primary"]:hover {
   background: #1a3fb8;
   border-color: #1a3fb8;

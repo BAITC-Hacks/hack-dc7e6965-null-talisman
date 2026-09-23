@@ -18,6 +18,18 @@ sys.path.insert(0, str(ROOT))
 from app import backend, orders
 from app.charts import demand_chart
 from app.checks import grouping, run_checks
+from app.theme import _CSS
+
+
+def test_corporate_primary_button_descendants_keep_white_text():
+    descendant_rule = (
+        '[data-testid="stBaseButton-primary"] *, '
+        '.stButton > button[kind="primary"] * {\n'
+        '  color: var(--nt-accent-ink) !important;\n'
+        '}'
+    )
+
+    assert descendant_rule in _CSS
 
 
 @pytest.fixture
