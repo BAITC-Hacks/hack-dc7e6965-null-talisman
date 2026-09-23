@@ -23,7 +23,16 @@ try:
     warehouse = st.selectbox("Склад для аналитики", warehouses)
     if warehouse != "Все склады":
         sales = sales[sales.warehouse.eq(warehouse)]
-    sales = sales.merge(data["products"][["sku", "category"]].drop_duplicates("sku"), on="sku", how="left")
+    product_columns = ["sku", "category"] + (["unit"] if "unit" in data["products"] else [])
+    sales = sales.merge(data["products"][product_columns].drop_duplicates("sku"), on="sku", how="left")
+    unit = "шт"
+    if "unit" in sales:
+        sales["unit"] = sales.unit.fillna("ед.")
+        units = sorted(sales.unit.unique())
+        if units:
+            unit = st.selectbox("Единица измерения", units)
+            sales = sales[sales.unit.eq(unit)]
+        st.caption("Разные единицы измерения показаны отдельно: метры и штуки не суммируются.")
     sales["category"] = sales.category.fillna("Без категории")
     sales["month"] = sales.date.dt.to_period("M").dt.to_timestamp()
     monthly = sales.groupby(["month", "category"], as_index=False).qty.sum()
@@ -31,7 +40,7 @@ try:
         st.info("Нет продаж для выбранного склада.")
     else:
         st.plotly_chart(px.line(monthly, x="month", y="qty", color="category",
-                                labels={"month": "Месяц", "qty": "Продано, шт.", "category": "Категория"}), width="stretch")
+                                labels={"month": "Месяц", "qty": f"Продано, {unit}", "category": "Категория"}), width="stretch")
     st.caption("Фактические продажи после загрузки, включая возвраты. Это обзор исходных данных; очищенный спрос и прогноз доступны в карточке позиции.")
 except (KeyError, ValueError, TypeError):
     st.warning("Для аналитики нужны таблицы sales и products с полями date, sku, qty, warehouse, category.")
