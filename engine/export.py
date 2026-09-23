@@ -30,7 +30,9 @@ def _prep(df: pd.DataFrame) -> pd.DataFrame:
                 f"{out.loc[index, 'explanation']} Изменено вручную: "
                 f"{out.loc[index, 'original_qty']:g} → {out.loc[index, 'recommended_qty']:g}."
             )
-    out["unit"] = "шт"
+    out["unit"] = out["unit"].fillna("ед.") if "unit" in out else "шт"
+    if "article" in out:
+        out["sku"] = out["article"].fillna(out["sku"])
     out["urgency"] = out["urgency"].map(URGENCY_LABELS).fillna(out["urgency"])
     out = out[list(EXPORT_COLUMNS.keys())].rename(columns=EXPORT_COLUMNS)
     for col in out.select_dtypes(include=["object", "string"]):

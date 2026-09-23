@@ -12,7 +12,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import pandas as pd
 import streamlit as st
 
-from app.backend import calculate, demo_files, load_files, series
+from app.backend import TABLES, calculate, demo_files, engine_revision, load_files, series
+from app.partner_ui import render_import
 from app.charts import demand_chart
 from app.orders import approve, csv_bytes, edited_order, fingerprint, xlsx_bytes
 
@@ -52,14 +53,17 @@ def downloads(frame, prefix):
 
 
 def position_card(frame, data, key):
+    frame = frame.assign(_demo=~frame.sku.astype(str).str.startswith("DEMO-")).sort_values(
+        ["_demo", "sku", "warehouse"], kind="stable").drop(columns="_demo").reset_index(drop=True)
     labels = [f"{row.sku} · {row['name']} · {row.warehouse}" for _, row in frame.iterrows()]
     selected = st.selectbox("Подробнее по позиции", range(len(frame)), format_func=lambda i: labels[i], key=f"detail_{key}")
     row = frame.iloc[selected]
     st.markdown(f"#### {row['name']}")
     st.write(row["explanation"])
     columns = st.columns(4)
-    columns[0].metric("Прогноз на горизонт", f"{row.forecast_horizon:,.0f} шт.")
-    columns[1].metric("Страховой запас", f"{row.get('safety_stock', 0):,.0f} шт.")
+    unit = row.get("unit", "шт")
+    columns[0].metric("Прогноз на горизонт", f"{row.forecast_horizon:,.0f} {unit}")
+    columns[1].metric("Страховой запас", f"{row.get('safety_stock', 0):,.0f} {unit}")
     cover = row.get("days_of_cover")
     columns[2].metric("Остатка хватит", f"{cover:.1f} дн." if pd.notna(cover) else "Нет данных")
     columns[3].metric("Доверие к прогнозу", CONFIDENCE.get(row.confidence, row.confidence))
@@ -81,7 +85,7 @@ st.title("Заказы поставщикам")
 st.write("Рассчитайте пополнение склада, проверьте обоснование и утвердите заказ.")
 
 saved = st.session_state.get("calculation_params", {})
-data, files = None, ()
+data, files, import_settings = None, (), None
 with st.sidebar:
     st.header("Параметры расчёта")
     today = st.date_input("Дата расчёта", value=date.fromisoformat(saved.get("today", "2026-09-23")))
@@ -90,7 +94,7 @@ with st.sidebar:
                       index=source_options.index(st.session_state.get("saved_source", source_options[0])))
     st.session_state.saved_source = source
     if source == "Загрузить файлы":
-        st.caption("Отдельный CSV или XLSX для каждой таблицы. Имена: sales, stock, products, suppliers; дополнительно in_transit, stockouts, growth, bom.")
+        st.caption("Можно выбрать весь набор исходных XLSX ИЭК / Systeme Electric с оригинальными именами. Также поддерживаются подготовленные таблицы sales, stock, products, suppliers и дополнительные файлы по контракту.")
         uploads = st.file_uploader("Входные таблицы", type=["csv", "xlsx"], accept_multiple_files=True,
                                    key=f"uploads_{st.session_state.get('upload_version', 0)}")
         if uploads:
@@ -100,6 +104,7 @@ with st.sidebar:
             st.caption("Используются: " + ", ".join(name for name, _ in files))
             if st.button("Очистить загруженные файлы"):
                 st.session_state.pop("saved_uploads", None)
+                st.session_state.pop("partner_prepared", None)
                 st.session_state.upload_version = st.session_state.get("upload_version", 0) + 1
                 st.rerun()
     else:
@@ -109,9 +114,12 @@ with st.sidebar:
             show_error(exc)
     if files:
         try:
-            data, warnings = load_files(files, today.isoformat())
-            for warning in warnings:
-                st.warning(str(warning))
+            if any(Path(name).stem not in TABLES for name, _ in files):
+                data, import_settings = render_import(files, today.isoformat())
+            else:
+                data, warnings = load_files(files, today.isoformat())
+                for warning in warnings:
+                    st.warning(str(warning))
         except Exception as exc:
             show_error(exc)
     warehouses = sorted(data["stock"]["warehouse"].dropna().astype(str).unique()) if data else []
@@ -134,6 +142,9 @@ with st.sidebar:
                                           value=float(saved.get("growth_override", {}).get(item, base)), step=5.0, key=f"growth_{item}")
     params = dict(today=today.isoformat(), warehouse=warehouse, category=category,
                   service_level=service, review_days=None, growth_override=growth)
+    params["engine_revision"] = engine_revision()
+    if import_settings is not None:
+        params["import_settings"] = import_settings
     run = st.button("Рассчитать", type="primary", width="stretch", disabled=data is None)
     st.caption("Решение принимает менеджер. Заказы поставщикам автоматически не отправляются.")
 
@@ -175,6 +186,9 @@ kpis[4].metric("Просроченных позиций", int(result.get("transi
 st.caption("Показатели рассчитаны по рекомендациям до ручных правок. Денежная оценка доступна только при наличии закупочных цен.")
 author = st.text_input("Кто утверждает заказ", value=st.session_state.get("saved_author", ""), placeholder="Имя и фамилия", key="approver")
 st.session_state.saved_author = author
+reference = result[result.sku.astype(str).str.startswith("DEMO-")]
+if not reference.empty and st.checkbox("Быстрый доступ к DEMO-позициям"):
+    position_card(reference, st.session_state.calculation_data, "reference")
 show_all = st.checkbox("Показать все позиции, включая те, где заказ не требуется")
 if show_all:
     st.dataframe(result, hide_index=True, width="stretch")
@@ -186,8 +200,13 @@ for supplier, group in positive.groupby("supplier_id", sort=False):
     group = group.assign(_priority=group.urgency.map({"critical": 0, "high": 1, "normal": 2}).fillna(3)).sort_values(["_priority", "sku", "warehouse"]).drop(columns="_priority").reset_index(drop=True)
     name = str(group.iloc[0].supplier_name)
     key = hashlib.sha256(str(supplier).encode()).hexdigest()[:12] + f"_{st.session_state.generation}"
-    with st.expander(f"{name} · {len(group)} позиций · {group.recommended_qty.sum():,.0f} шт.", expanded=True):
-        shown = group[["sku", "name", "warehouse", "on_hand", "in_transit", "forecast_horizon", "recommended_qty", "urgency", "confidence"]].copy()
+    with st.expander(f"{name} · {len(group)} позиций", expanded=True):
+        shown_columns = ["sku", "name", "warehouse", "on_hand", "in_transit", "forecast_horizon", "recommended_qty", "urgency", "confidence"]
+        if "unit" in group:
+            shown_columns.insert(2, "unit")
+        if "article" in group:
+            shown_columns.insert(1, "article")
+        shown = group[shown_columns].copy()
         shown["urgency"] = shown.urgency.map(URGENCY).fillna(shown.urgency)
         shown["confidence"] = shown.confidence.map(CONFIDENCE).fillna(shown.confidence)
         editor_key = f"editor_{key}"
@@ -200,7 +219,8 @@ for supplier, group in positive.groupby("supplier_id", sort=False):
         edited = st.data_editor(editor_inputs[str(supplier)], key=editor_key, hide_index=True, width="stretch",
                                 disabled=[col for col in shown if col != "recommended_qty"],
                                 column_config={
-                                    "sku": "Артикул", "name": "Номенклатура", "warehouse": "Склад",
+                                    "sku": "Код / артикул", "name": "Номенклатура", "warehouse": "Склад",
+                                    "unit": "Ед.", "article": "Артикул поставщика",
                                     "on_hand": "Остаток", "in_transit": "В пути", "forecast_horizon": "Прогноз",
                                     "recommended_qty": st.column_config.NumberColumn("К заказу ✎", min_value=0, max_value=1_000_000_000, step=1, required=True),
                                     "urgency": "Срочность", "confidence": "Уверенность",
@@ -214,8 +234,8 @@ for supplier, group in positive.groupby("supplier_id", sort=False):
             continue
         changed = draft[draft.manually_changed]
         for _, row in changed.iterrows():
-            st.caption(f"Изменено вручную: {row.sku} / {row.warehouse}: {row.original_qty:g} → {row.recommended_qty:g} шт.")
-        st.caption(f"Текущий заказ: {(draft.recommended_qty > 0).sum()} позиций, {draft.recommended_qty.sum():,.0f} шт. Нулевые количества не попадут в выгрузку.")
+            st.caption(f"Изменено вручную: {row.sku} / {row.warehouse}: {row.original_qty:g} → {row.recommended_qty:g} {row.get('unit', 'шт')}.")
+        st.caption(f"Текущий заказ: {(draft.recommended_qty > 0).sum()} позиций. Количество в единицах каждого товара; нулевые строки не попадут в выгрузку.")
         if st.checkbox("Показать обоснование и график", key=f"show_card_{key}"):
             position_card(group, st.session_state.calculation_data, key)
         approved = st.session_state.approvals.get(str(supplier))

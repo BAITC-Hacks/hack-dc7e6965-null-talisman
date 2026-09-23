@@ -20,13 +20,13 @@ def demand_chart(series: pd.DataFrame) -> go.Figure:
         figure.add_trace(go.Scatter(x=points["month"], y=points["raw"], mode="markers",
                                    name="Разовый сверхобъём", marker={"color": "#dc2626", "size": 10},
                                    customdata=points["oneoff"],
-                                   hovertemplate="Исключено %{customdata:.0f} шт.<extra></extra>"))
+                                   hovertemplate="Исключено %{customdata:.0f} ед.<extra></extra>"))
     if "stockout_days" in table:
         for month in table.loc[table["stockout_days"].fillna(0) > 0, "month"]:
             figure.add_vrect(x0=month, x1=month + pd.offsets.MonthBegin(1),
                              fillcolor="#f59e0b", opacity=.12, line_width=0, layer="below")
     figure.update_layout(height=360, margin={"l": 10, "r": 10, "t": 20, "b": 10},
-                         yaxis_title="Количество, шт.", xaxis_title=None,
+                         yaxis_title="Количество в единицах товара", xaxis_title=None,
                          legend={"orientation": "h", "y": 1.15}, hovermode="x unified",
                          paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)")
     return figure

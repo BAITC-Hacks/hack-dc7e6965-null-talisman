@@ -1,7 +1,9 @@
 """Only integration point with the team's engine; no forecasting logic here."""
 
 import importlib
+import hashlib
 import io
+import re
 import subprocess
 import sys
 import tempfile
@@ -13,6 +15,37 @@ import streamlit as st
 
 ROOT = Path(__file__).resolve().parents[1]
 TABLES = ("sales", "stock", "in_transit", "stockouts", "products", "suppliers", "growth", "bom")
+
+
+def engine_revision():
+    digest = hashlib.sha256()
+    for path in sorted((ROOT / "engine").glob("*.py")):
+        digest.update(path.read_bytes())
+    digest.update((ROOT / "app" / "checks.py").read_bytes())
+    return digest.hexdigest()
+
+
+@st.cache_data(show_spinner=False, max_entries=4)
+def inspect_partner_files(files):
+    from app.partner_import import inspect_files
+    return inspect_files(files)
+
+
+@st.cache_data(show_spinner=False, max_entries=4)
+def load_partner_files(files, settings, today):
+    from app.partner_import import convert_files
+    tables, notes = convert_files(files, inspect_partner_files(files), settings, today)
+    normalized = tuple((f"{name}.csv", table.to_csv(index=False).encode("utf-8"))
+                       for name, table in tables.items())
+    data, warnings = load_files(normalized, today)
+    # The generic loader drops qty=0 transaction rows. In a monthly report,
+    # explicit zero months are observations and must retain the history bounds.
+    zeros = tables["sales"].loc[tables["sales"].qty.eq(0)].copy()
+    if not zeros.empty:
+        zeros["date"] = pd.to_datetime(zeros["date"])
+        zeros["client_id"] = engine_function("engine.io", "hash_client_id")("UNKNOWN")
+        data["sales"] = pd.concat([data["sales"], zeros], ignore_index=True)
+    return data, notes + warnings
 
 
 class BackendUnavailable(ValueError):
@@ -108,7 +141,17 @@ def validate_result(frame):
 
 @st.cache_data(show_spinner=False, max_entries=8)
 def calculate(data, params):
-    return validate_result(engine_function("engine.pipeline", "recommend")(data, params))
+    result = validate_result(engine_function("engine.pipeline", "recommend")(data, params))
+    extras = [col for col in ("unit", "article", "import_note") if col in data["products"] and col not in result]
+    if extras:
+        result = result.merge(data["products"][["sku", *extras]], on="sku", how="left", validate="many_to_one")
+    if "import_note" in result:
+        result["explanation"] = result.apply(
+            lambda row: re.sub(r"\bшт\b", lambda _: str(row.get("unit", "ед.")), row.explanation), axis=1
+        ) if not result.empty else result["explanation"]
+        result["explanation"] += " " + result.import_note.fillna("")
+        result["confidence"] = "low"
+    return result
 
 
 @st.cache_data(show_spinner=False, max_entries=32)

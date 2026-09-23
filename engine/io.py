@@ -47,7 +47,9 @@ def load_dir(source_dir: str | Path) -> dict[str, pd.DataFrame]:
     for name in REQUIRED_COLUMNS:
         path = source_dir / f"{name}.csv"
         if path.exists():
-            data[name] = pd.read_csv(path)
+            data[name] = pd.read_csv(path, dtype={column: str for column in (
+                "sku", "supplier_id", "client_id", "parent_sku", "component_sku", "article", "warehouse", "category"
+            )})
         elif name in OPTIONAL:
             data[name] = _empty_frame(name)
         else:

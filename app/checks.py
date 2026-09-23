@@ -2,6 +2,7 @@
 
 from dataclasses import dataclass, field
 import logging
+from time import perf_counter
 
 import numpy as np
 import pandas as pd
@@ -19,6 +20,7 @@ class CheckResult:
     status: str
     message: str
     rows: list = field(default_factory=list)
+    elapsed_seconds: float = 0.0
 
 
 def copy_data(data):
@@ -98,8 +100,8 @@ def sources(data, params, recommend):
         raise MissingEvidence("Нет продаж комплектов с компонентами в результате расчёта.")
     target = select(base, entries.iloc[0].component_sku)
     changed = copy_data(data)
-    # load_data already exploded the kits. Remove both the parent sales and
-    # their derived component rows, marked by the loader with client_id=BOM.
+    # Remove parents and any already expanded component rows. Current engine
+    # expands BOM at calculation time; this also handles older prepared data.
     changed["sales"] = changed["sales"][~changed["sales"].sku.isin(bom.parent_sku) & changed["sales"].client_id.ne("BOM")].copy()
     compare("Без продаж комплектов → потребность компонента", changed, target=(target.sku, target.warehouse))
     return rows
@@ -162,10 +164,10 @@ def stockouts(data, params, recommend):
     changed = copy_data(data)
     changed["stockouts"] = changed["stockouts"].loc[changed["stockouts"].sku.ne(with_outages.sku)].copy()
     without = select(recommend(changed, dict(params)), with_outages.sku, with_outages.warehouse)
-    # Match tests/test_acceptance.py: restored demand increases the forecast.
-    # need_raw also includes safety stock, which can fall as variance decreases.
     return [comparison("Прогноз спроса без восстановления → с восстановлением", without.forecast_horizon,
-                       with_outages.forecast_horizon, with_outages.forecast_horizon > without.forecast_horizon)]
+                       with_outages.forecast_horizon, with_outages.forecast_horizon > without.forecast_horizon),
+            comparison("Потребность без восстановления → с восстановлением", without.need_raw,
+                       with_outages.need_raw, with_outages.need_raw > without.need_raw)]
 
 
 def oneoff(data, params, recommend):
@@ -218,6 +220,7 @@ def run_checks(data, params, progress=None):
     # Evaluate all reference SKUs regardless of the main page's display filters.
     settings = dict(params, warehouse=None, category=None)
     for index, (title, scenario) in enumerate(SCENARIOS):
+        started = perf_counter()
         try:
             rows = scenario(copy_data(data), dict(settings), recommend)
             passed = all(row["Результат"] == "✅" for row in rows)
@@ -228,6 +231,7 @@ def run_checks(data, params, progress=None):
         except Exception:
             logging.getLogger(__name__).exception("Acceptance scenario failed: %s", title)
             results.append(CheckResult(title, "error", "Сценарий не удалось выполнить. Проверьте контракт ядра и входные данные."))
+        results[-1].elapsed_seconds = perf_counter() - started
         if progress:
             progress((index + 1) / len(SCENARIOS))
     return results
