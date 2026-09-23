@@ -42,43 +42,60 @@ def detect_and_trim_oneoffs(sales: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataF
     lines = lines.copy()
     lines["qty"] = lines["qty"].astype(float)  # медиана/обрезка разовых заказов даёт float
     lines["oneoff_excluded"] = 0.0
-    # .dt.to_period один раз на весь датасет, а не в цикле на каждую группу —
-    # раньше это (и построчный python-цикл ниже) держало ~150к строк продаж на
-    # каждый вызов recommend(), что превращало страницу "Проверки" в минуты ожидания.
     lines["month"] = lines["date"].dt.to_period("M")
-    events = []
+    key = ["sku", "warehouse"]
 
-    for (sku, warehouse), grp in lines.groupby(["sku", "warehouse"], sort=False):
-        pos = grp[(grp["qty"] > 0) & (grp["client_id"] != "BOM")]
-        if len(pos) < 3:
-            continue
-        median = pos["qty"].median()
-        mad = (pos["qty"] - median).abs().median()
-        scale = 1.4826 * mad if mad > 0 else (pos["qty"] - median).abs().mean()
-        if not scale or scale <= 0:
-            scale = 1.0
+    # Векторизовано по всем группам разом через groupby().transform() — раньше
+    # тут был python-цикл по ~сотням (sku, warehouse), каждая итерация которого
+    # заново гоняла несколько pandas-вызовов на маленьких данных; накладные
+    # расходы самого pandas на такой цикл и были главной частью времени
+    # detect_and_trim_oneoffs (см. профиль recommend() на странице "Проверки").
+    pos_mask = (lines["qty"] > 0) & (lines["client_id"] != "BOM")
+    pos = lines.loc[pos_mask]
+    pos_group = pos.groupby(key, sort=False)
 
-        median_month_total = grp.groupby("month")["qty"].sum().median()
-        client_months = pos.groupby("client_id")["month"].nunique()
+    median_per_line = pos_group["qty"].transform("median")
+    abs_dev = (pos["qty"] - median_per_line).abs()
+    mad_per_line = abs_dev.groupby([pos["sku"], pos["warehouse"]], sort=False).transform("median")
+    mean_dev_per_line = abs_dev.groupby([pos["sku"], pos["warehouse"]], sort=False).transform("mean")
+    scale = np.where(mad_per_line > 0, 1.4826 * mad_per_line, mean_dev_per_line)
+    scale = np.where(scale > 0, scale, 1.0)
+    pos_count = pos_group["qty"].transform("size")
 
-        robust_z = (pos["qty"] - median) / scale
-        significant = pos["qty"] > ONEOFF_SIGNIFICANCE_FRAC * max(median_month_total, 0)
-        irregular = pos["client_id"].map(client_months).fillna(0) <= ONEOFF_MAX_CLIENT_MONTHS
-        flagged = pos[(robust_z > ONEOFF_ROBUST_Z) & significant & irregular]
-        if flagged.empty:
-            continue
+    # median_month_total считается по ВСЕЙ группе (включая BOM/возвраты), не
+    # только по pos — как и в исходной построчной версии.
+    monthly_totals = lines.groupby(key + ["month"], sort=False)["qty"].sum()
+    median_month_total_by_group = monthly_totals.groupby(level=[0, 1]).median()
+    median_month_total_per_line = pd.MultiIndex.from_arrays(
+        [pos["sku"], pos["warehouse"]]
+    ).map(median_month_total_by_group)
 
-        excluded = flagged["qty"] - median
-        lines.loc[flagged.index, "qty"] = median
-        lines.loc[flagged.index, "oneoff_excluded"] = excluded
-        for i in flagged.index:
-            events.append({
-                "sku": sku, "warehouse": warehouse, "date": flagged.at[i, "date"],
-                "client_id": flagged.at[i, "client_id"], "excluded_qty": excluded.at[i],
-            })
+    client_months_per_line = pos.groupby(key + ["client_id"], sort=False)["month"].transform("nunique")
+
+    robust_z = (pos["qty"] - median_per_line) / scale
+    significant = pos["qty"] > ONEOFF_SIGNIFICANCE_FRAC * np.maximum(median_month_total_per_line, 0)
+    irregular = client_months_per_line <= ONEOFF_MAX_CLIENT_MONTHS
+    enough_history = pos_count >= 3
+    flagged_mask = (robust_z > ONEOFF_ROBUST_Z) & significant & irregular & enough_history
 
     lines = lines.drop(columns=["month"])
-    return lines, pd.DataFrame(events, columns=["sku", "warehouse", "date", "client_id", "excluded_qty"])
+    if not flagged_mask.any():
+        return lines, pd.DataFrame(columns=["sku", "warehouse", "date", "client_id", "excluded_qty"])
+
+    flagged_idx = pos.index[flagged_mask]
+    median_at_flagged = median_per_line[flagged_mask]
+    excluded = lines.loc[flagged_idx, "qty"] - median_at_flagged.values
+    lines.loc[flagged_idx, "qty"] = median_at_flagged.values
+    lines.loc[flagged_idx, "oneoff_excluded"] = excluded.values
+
+    events = pd.DataFrame({
+        "sku": lines.loc[flagged_idx, "sku"].values,
+        "warehouse": lines.loc[flagged_idx, "warehouse"].values,
+        "date": lines.loc[flagged_idx, "date"].values,
+        "client_id": lines.loc[flagged_idx, "client_id"].values,
+        "excluded_qty": excluded.values,
+    })
+    return lines, events
 
 
 def _month_range(start: pd.Period, end: pd.Period) -> pd.PeriodIndex:
