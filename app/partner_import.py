@@ -142,9 +142,25 @@ def _read(report, contents):
     frame = frame.loc[frame.sku.ne("")].copy()
     if report.kind == "transit":
         meaningful_columns = [column for column in frame if not column.startswith("_empty_")]
+        normalized = frame[meaningful_columns].copy()
+        for column in meaningful_columns:
+            normalized[column] = normalized[column].map(text)
+        duplicate_rows = normalized.duplicated(keep="first")
         original_count = len(frame)
-        frame = frame.drop_duplicates(subset=meaningful_columns).copy()
+        frame = frame.loc[~duplicate_rows].copy()
         frame.attrs["exact_duplicate_rows_removed"] = original_count - len(frame)
+    if report.kind == "moq" and frame.sku.duplicated().any():
+        article = next((column for column in ("артикул поставщика", "артикул иэк", "артикул") if column in frame), None)
+        constraint = next((column for column in ("кратность", "мин. разр. к отгр.") if column in frame), None)
+        semantic_columns = [column for column in (article, constraint) if column]
+        semantic = frame[["sku", *semantic_columns]].copy()
+        for column in semantic_columns:
+            semantic[column] = semantic[column].map(text)
+        conflicting = semantic.groupby("sku", sort=False)[semantic_columns].nunique(dropna=False).gt(1).any(axis=1)
+        if not conflicting.any():
+            original_count = len(frame)
+            frame = frame.drop_duplicates(subset=["sku"], keep="first").copy()
+            frame.attrs["duplicate_moq_rows_removed"] = original_count - len(frame)
     if report.kind != "movements" and frame.sku.duplicated().any():
         raise ValueError(f"{report.filename}: код товара повторяется; уточните структуру, чтобы не удвоить объём.")
     return frame
@@ -212,6 +228,18 @@ def convert_files(files, reports, settings, today):
             warnings.append(
                 f"{BRANDS[brand]}: удалено {duplicate_transit_rows} полностью совпадающих строк поставки, "
                 "чтобы не удвоить объём."
+            )
+        duplicate_moq_rows = sum(
+            int(frame.attrs.get("duplicate_moq_rows_removed", 0)) for frame in frames.values()
+        )
+        if duplicate_moq_rows == 1:
+            warnings.append(
+                f"{BRANDS[brand]}: удалена 1 повторная строка MOQ с теми же артикулом и ограничением."
+            )
+        elif duplicate_moq_rows > 1:
+            warnings.append(
+                f"{BRANDS[brand]}: удалено {duplicate_moq_rows} повторных строк MOQ "
+                "с теми же артикулами и ограничениями."
             )
         if "movements" in chosen and sales_kind != "movements":
             warnings.append(f"{BRANDS[brand]}: использованы месячные продажи; динамика не прибавляется к ним.")

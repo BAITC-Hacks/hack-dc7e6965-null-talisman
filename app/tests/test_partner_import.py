@@ -102,7 +102,7 @@ def test_transit_import_deduplicates_only_identical_rows(iek_files):
     row = ["001_", "ARTICLE-01", "Кабель тестовый", 3, 999]
     duplicate_transit = (
         "Путь ИЭК 22.09.2026.xlsx",
-        workbook([headers, row, row]),
+        workbook([headers, row, ["001_", "ARTICLE-01", "Кабель  тестовый ", 3, 999]]),
     )
     files = (*iek_files[:-1], duplicate_transit)
 
