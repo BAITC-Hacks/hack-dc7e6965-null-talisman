@@ -91,6 +91,23 @@ def _sigma_month(s: pd.Series, avail: pd.Series, window: int = 12) -> float:
     return float(source.std(ddof=0)) if len(source) > 1 else float(recent.mean() * 0.5)
 
 
+def _blend_season_index(s: pd.Series, category_index: dict[int, float]) -> tuple[dict[int, float], bool]:
+    """Сезонность sku, смешанная с сезонностью категории по длине истории.
+    Возвращает (season_index, short_history). Вынесено отдельно, чтобы backtest
+    мог честно пересчитать сезонность только по train-части ряда — иначе
+    season_index, посчитанный по полному ряду, «подглядывает» в отложенные
+    для backtest месяцы и WAPE модели становится оптимистичнее реального."""
+    n = len(s)
+    if n >= SHORT_HISTORY_MONTHS:
+        sku_index = _seasonal_ratio_to_cma(s)
+        years = n / 12.0
+        w = min(1.0, years / 3.0)
+        blended = {m: w * sku_index.get(m, 1.0) + (1 - w) * category_index.get(m, 1.0) for m in range(1, 13)}
+        mean_f = np.mean(list(blended.values())) or 1.0
+        return {m: float(np.clip(v / mean_f, SEASON_MIN, SEASON_MAX)) for m, v in blended.items()}, False
+    return (category_index or {m: 1.0 for m in range(1, 13)}), True
+
+
 def _wape(actual: np.ndarray, forecast: np.ndarray) -> float:
     denom = np.sum(np.abs(actual))
     if denom <= 0:
@@ -133,15 +150,8 @@ def forecast_sku(series: pd.DataFrame, category_index: dict[int, float], growth_
             "flags": ["intermittent"], "wape_model": None, "wape_naive": None,
         }
 
-    if n_months >= SHORT_HISTORY_MONTHS:
-        sku_index = _seasonal_ratio_to_cma(s)
-        years = n_months / 12.0
-        w = min(1.0, years / 3.0)
-        blended = {m: w * sku_index.get(m, 1.0) + (1 - w) * category_index.get(m, 1.0) for m in range(1, 13)}
-        mean_f = np.mean(list(blended.values())) or 1.0
-        season_index = {m: float(np.clip(v / mean_f, SEASON_MIN, SEASON_MAX)) for m, v in blended.items()}
-    else:
-        season_index = category_index or {m: 1.0 for m in range(1, 13)}
+    season_index, short_history = _blend_season_index(s, category_index)
+    if short_history:
         flags.append("short_history")
 
     deseason = s / s.index.map(lambda p: season_index.get(p.month, 1.0))
@@ -155,12 +165,17 @@ def forecast_sku(series: pd.DataFrame, category_index: dict[int, float], growth_
         confidence = "high"
     if n_months > BACKTEST_MONTHS + 6:
         train, hold = s.iloc[:-BACKTEST_MONTHS], s.iloc[-BACKTEST_MONTHS:]
-        train_deseason = train / train.index.map(lambda p: season_index.get(p.month, 1.0))
+        # Сезонность для backtest считаем заново по train — иначе season_index
+        # выше (посчитанный по всему ряду) утекает в предсказание отложенных
+        # месяцев, и WAPE модели перестаёт быть честной оценкой "как модель
+        # предсказала бы без будущего".
+        train_season_index, _ = _blend_season_index(train, category_index)
+        train_deseason = train / train.index.map(lambda p: train_season_index.get(p.month, 1.0))
         bt_level = float(train_deseason.tail(LEVEL_WINDOW_MONTHS).mean())
         bt_trend = _theil_sen_pct_per_month(train_deseason)
         preds = []
         for h, month in enumerate(hold.index, start=1):
-            preds.append(bt_level * (1 + bt_trend / 100) ** h * season_index.get(month.month, 1.0))
+            preds.append(bt_level * (1 + bt_trend / 100) ** h * train_season_index.get(month.month, 1.0))
         wape_model = _wape(hold.values, np.array(preds))
         wape_naive = _wape(hold.values, np.full(len(hold), train.tail(LEVEL_WINDOW_MONTHS).mean()))
         if wape_model > wape_naive * 1.1:

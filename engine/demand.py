@@ -3,6 +3,7 @@
 """
 from __future__ import annotations
 
+import numpy as np
 import pandas as pd
 
 ONEOFF_ROBUST_Z = 6.0
@@ -111,47 +112,42 @@ def monthly_clean_series(trimmed_lines: pd.DataFrame, stockouts: pd.DataFrame,
         so["end_month"] = so["end"].dt.to_period("M")
 
     results = []
-    for (sku, warehouse), grp in monthly.groupby(["sku", "warehouse"]):
-        # реиндексируем только числовой ряд — reindex всего grp пытается залить
-        # fill_value и в текстовые колонки sku/warehouse, это им не подходит
-        actual = grp.set_index("month")["actual"].reindex(
-            _month_range(grp["month"].min(), grp["month"].max()), fill_value=0.0
-        )
-        grp = pd.DataFrame({"actual": actual})
-        grp.index.name = "month"
+    for (sku, warehouse), grp in monthly.groupby(["sku", "warehouse"], sort=False):
+        # реиндексируем только числовой ряд, не весь grp — заливка fill_value
+        # в текстовые колонки sku/warehouse не нужна и не подходит по типу
+        month_index = _month_range(grp["month"].min(), grp["month"].max())
+        actual = grp.set_index("month")["actual"].reindex(month_index, fill_value=0.0)
 
-        avail = pd.Series(1.0, index=grp.index)
+        avail = np.ones(len(month_index))
         sku_stockouts = so[(so["sku"] == sku) & (so["warehouse"] == warehouse)] if not so.empty else so
         if sku_stockouts is not None and not sku_stockouts.empty:
-            for m in grp.index:
-                month_start = m.start_time
-                month_end = m.end_time
-                days_in_month = (month_end - month_start).days + 1
+            # редкий путь (единицы sku из ~сотен имеют stockout) — точный
+            # двойной цикл месяц×период здесь не влияет на общее время расчёта
+            for i, m in enumerate(month_index):
+                days_in_month = m.days_in_month
                 stockout_days = 0
                 for _, row in sku_stockouts.iterrows():
-                    overlap_start = max(row["start"], month_start)
-                    overlap_end = min(row["end"], month_end)
+                    overlap_start = max(row["start"], m.start_time)
+                    overlap_end = min(row["end"], m.end_time)
                     if overlap_end >= overlap_start:
                         stockout_days += (overlap_end - overlap_start).days + 1
-                avail.loc[m] = max(0.0, (days_in_month - stockout_days) / days_in_month)
+                avail[i] = max(0.0, (days_in_month - stockout_days) / days_in_month)
 
-        series_median = grp["actual"].median() or 0.0
-        clean = grp["actual"].copy()
+        actual_vals = actual.values
+        series_median = float(np.median(actual_vals)) if len(actual_vals) else 0.0
         low_avail_mask = avail < STOCKOUT_MIN_AVAILABILITY
-        clean.loc[~low_avail_mask & (avail > 0)] = (
-            grp.loc[~low_avail_mask & (avail > 0), "actual"] / avail.loc[~low_avail_mask & (avail > 0)]
-        )
+        divisor = np.where(avail > 0, avail, 1.0)  # избегаем деления на 0 (результат всё равно отбрасывается маской)
         # почти пустые месяцы (f < 0.5): делить опасно -> заполняем медианой ряда
-        clean.loc[low_avail_mask] = series_median
+        clean = np.where(low_avail_mask, series_median, actual_vals / divisor)
         cap = max(series_median * CLEAN_CAP_MULT, 1.0)
-        clean = clean.clip(upper=cap)
+        clean = np.minimum(clean, cap)
 
         out = pd.DataFrame({
             "sku": sku, "warehouse": warehouse,
-            "month": grp.index, "actual": grp["actual"].values,
-            "availability_frac": avail.values, "clean": clean.values,
+            "month": month_index, "actual": actual_vals,
+            "availability_frac": avail, "clean": clean,
         })
-        out["lost_demand"] = (out["clean"] - out["actual"]).clip(lower=0)
+        out["lost_demand"] = np.clip(out["clean"] - out["actual"], 0, None)
         results.append(out)
 
     return pd.concat(results, ignore_index=True) if results else pd.DataFrame(
