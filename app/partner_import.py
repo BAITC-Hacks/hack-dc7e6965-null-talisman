@@ -140,6 +140,11 @@ def _read(report, contents):
         raise ValueError(f"{report.filename}: нет кода товара.")
     frame["sku"] = frame[code].map(text)
     frame = frame.loc[frame.sku.ne("")].copy()
+    if report.kind == "transit":
+        meaningful_columns = [column for column in frame if not column.startswith("_empty_")]
+        original_count = len(frame)
+        frame = frame.drop_duplicates(subset=meaningful_columns).copy()
+        frame.attrs["exact_duplicate_rows_removed"] = original_count - len(frame)
     if report.kind != "movements" and frame.sku.duplicated().any():
         raise ValueError(f"{report.filename}: код товара повторяется; уточните структуру, чтобы не удвоить объём.")
     return frame
@@ -196,6 +201,18 @@ def convert_files(files, reports, settings, today):
         stock_kind = "overview" if "overview" in chosen else "stock"
         needed = {sales_kind, stock_kind} | ({"moq", "transit", "stock"} & chosen.keys())
         frames = {k: _read(chosen[k], contents) for k in needed}
+        duplicate_transit_rows = sum(
+            int(frame.attrs.get("exact_duplicate_rows_removed", 0)) for frame in frames.values()
+        )
+        if duplicate_transit_rows == 1:
+            warnings.append(
+                f"{BRANDS[brand]}: удалена 1 полностью совпадающая строка поставки, чтобы не удвоить объём."
+            )
+        elif duplicate_transit_rows > 1:
+            warnings.append(
+                f"{BRANDS[brand]}: удалено {duplicate_transit_rows} полностью совпадающих строк поставки, "
+                "чтобы не удвоить объём."
+            )
         if "movements" in chosen and sales_kind != "movements":
             warnings.append(f"{BRANDS[brand]}: использованы месячные продажи; динамика не прибавляется к ним.")
         sf = frames[sales_kind]
