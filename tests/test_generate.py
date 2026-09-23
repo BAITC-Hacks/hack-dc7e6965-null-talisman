@@ -157,3 +157,20 @@ def test_bom_models_three_multi_component_kits(tmp_path: Path) -> None:
     assert len(component_counts) == 3
     assert component_counts.min() >= 3
     assert bom["qty_per"].gt(0).all()
+
+
+def test_generated_stock_keeps_critical_share_actionable(tmp_path: Path) -> None:
+    """The full demo should highlight a useful minority, not mark everything red."""
+    from data.generate import TODAY
+    from engine.io import load_and_prepare
+    from engine.pipeline import recommend
+
+    output_dir = tmp_path / "demo"
+    _generate_to(output_dir)
+    data, warnings = load_and_prepare(output_dir, TODAY)
+
+    assert not warnings
+    result = recommend(data, {"today": TODAY})
+    critical_share = result["urgency"].eq("critical").mean()
+
+    assert 0.05 <= critical_share <= 0.15, f"critical share: {critical_share:.1%}"
