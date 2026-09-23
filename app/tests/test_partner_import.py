@@ -133,6 +133,38 @@ def test_transit_import_rejects_conflicting_rows_for_one_sku(iek_files):
         backend.load_partner_files(files, settings(), "2026-09-23")
 
 
+def test_moq_import_deduplicates_matching_constraints(iek_files):
+    duplicate_moq = (
+        "MOQ ИЭК.xlsx",
+        workbook([
+            ["№", "Код 1с", "Артикул поставщика", "Наименование", "Мин. разр. к отгр."],
+            [1, "001_", "ARTICLE-01", "Кабель тестовый", 12],
+            [2, "001_", "ARTICLE-01", "Кабель тестовый, другое описание", 12],
+        ]),
+    )
+    files = (*iek_files[:2], duplicate_moq, iek_files[3])
+
+    data, warnings = backend.load_partner_files(files, settings(), "2026-09-23")
+
+    assert data["products"].iloc[0].moq == 12
+    assert any("1 повторная строка MOQ" in warning for warning in warnings)
+
+
+def test_moq_import_rejects_conflicting_constraints(iek_files):
+    conflicting_moq = (
+        "MOQ ИЭК.xlsx",
+        workbook([
+            ["№", "Код 1с", "Артикул поставщика", "Наименование", "Мин. разр. к отгр."],
+            [1, "001_", "ARTICLE-01", "Кабель тестовый", 12],
+            [2, "001_", "ARTICLE-01", "Кабель тестовый", 24],
+        ]),
+    )
+    files = (*iek_files[:2], conflicting_moq, iek_files[3])
+
+    with pytest.raises(ValueError, match="код товара повторяется"):
+        backend.load_partner_files(files, settings(), "2026-09-23")
+
+
 def test_movements_sign_aggregation_and_no_double_count(iek_files):
     movement = ("Динамика продаж_2025-2026.xlsx", workbook([
         ["Дата", "Номер", "Документ", "Код", "Номенклатура", "Ед.", "Склад", "Количество"],
