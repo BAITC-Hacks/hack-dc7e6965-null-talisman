@@ -93,6 +93,46 @@ def test_partial_transit_explains_missing_inputs(iek_files):
         convert_files(files, reports, settings(), "2026-09-23")
 
 
+def test_transit_import_deduplicates_only_identical_rows(iek_files):
+    headers = [
+        "Код 1с", "Артикул ИЭК", "Наименование",
+        "УТ-1 от 01.09.2026 (поступление до 01.10.2026)",
+        "УТ-2 (поступление до 01.12.2026)",
+    ]
+    row = ["001_", "ARTICLE-01", "Кабель тестовый", 3, 999]
+    duplicate_transit = (
+        "Путь ИЭК 22.09.2026.xlsx",
+        workbook([headers, row, row]),
+    )
+    files = (*iek_files[:-1], duplicate_transit)
+
+    data, warnings = backend.load_partner_files(files, settings(), "2026-09-23")
+
+    by_eta = data["in_transit"].groupby("eta").qty.sum()
+    assert by_eta[pd.Timestamp("2026-10-01")] == 3
+    assert by_eta[pd.Timestamp("2026-12-01")] == 999
+    assert any("1 полностью совпадающая строка" in warning for warning in warnings)
+
+
+def test_transit_import_rejects_conflicting_rows_for_one_sku(iek_files):
+    headers = [
+        "Код 1с", "Артикул ИЭК", "Наименование",
+        "УТ-1 от 01.09.2026 (поступление до 01.10.2026)",
+    ]
+    conflicting_transit = (
+        "Путь ИЭК 22.09.2026.xlsx",
+        workbook([
+            headers,
+            ["001_", "ARTICLE-01", "Кабель тестовый", 3],
+            ["001_", "ARTICLE-01", "Кабель тестовый", 4],
+        ]),
+    )
+    files = (*iek_files[:-1], conflicting_transit)
+
+    with pytest.raises(ValueError, match="код товара повторяется"):
+        backend.load_partner_files(files, settings(), "2026-09-23")
+
+
 def test_movements_sign_aggregation_and_no_double_count(iek_files):
     movement = ("Динамика продаж_2025-2026.xlsx", workbook([
         ["Дата", "Номер", "Документ", "Код", "Номенклатура", "Ед.", "Склад", "Количество"],
