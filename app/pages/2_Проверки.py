@@ -25,7 +25,7 @@ if "calculation_data" not in st.session_state or not st.session_state.get("calcu
 signature = st.session_state.calculation_signature
 cache = st.session_state.setdefault("check_cache", {})
 run = st.button("Прогнать все", type="primary")
-refresh = st.button("Повторить без кэша", disabled=signature not in cache)
+refresh = st.button("Повторить без кэша")
 if run and signature in cache and not refresh:
     st.session_state.check_report = cache[signature]
     st.info("Показан сохранённый прогон для тех же данных и параметров.")

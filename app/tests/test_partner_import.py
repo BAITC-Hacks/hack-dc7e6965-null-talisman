@@ -199,6 +199,7 @@ def test_checks_cache_timestamp_and_strict_stockout(monkeypatch):
     app.session_state.calculation_signature = "first"
     app.run()
     next(b for b in app.button if b.label == "Прогнать все").click().run()
+    assert not next(b for b in app.button if b.label == "Повторить без кэша").disabled
     next(b for b in app.button if b.label == "Прогнать все").click().run()
     assert len(calls) == 1 and not app.exception
     assert any("UTC" in c.value for c in app.caption)
